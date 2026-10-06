@@ -14,7 +14,7 @@ import SwiftUI
 /// `AVSampleBufferAudioRenderer` when the format description can be built.
 /// Dolby Vision atoms are attached to the format description; the RPU itself is
 /// not composited in this process.
-public final class CinecorePlayer: NSObject, ObservableObject {
+public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendable {
     @Published public private(set) var info: MediaInfo?
     @Published public private(set) var time: Double = 0
     @Published public private(set) var duration: Double = 0

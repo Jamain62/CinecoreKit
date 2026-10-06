@@ -23,7 +23,10 @@ RPU composer and does not render Atmos objects. The player is compiled only
 for iOS, macOS, and tvOS.
 
 `MediaByteSource` is how bytes are read. `FileByteSource` seeks in a local
-file. `HTTPByteSource` sends `Range` requests and keeps a small block cache.
+file. `HTTPByteSource` keeps one `URLSession` and sends every `Range` on it,
+so the CDN connection is reused. A short or partial response is an error.
+The player then buffers and retries that same sample instead of treating the
+hole as a frame. The block cache is 256 KB and is not the file.
 An MP4 index reads the movie header and skips `mdat`. A Matroska index reads
 one cluster at a time and keeps only the sample table. The table is in
 memory. The picture bytes are not, until a sample is enqueued.
@@ -32,6 +35,12 @@ A failed sample read does not advance the cursor. The clock pauses, `buffering`
 becomes true, and the same sample is tried again with a longer wait, up to
 five seconds. A seek past the last audio sample stays past the end instead of
 restarting that track at zero.
+
+An hour of a 50–80 GB HEVC remux has not been played on an iPhone or Apple TV
+from this tree. There is no iOS or tvOS SDK here, so `Player.swift` has not
+been executed. What was tested is the byte path: a remote object whose length
+is 60 GB, read at the start, the middle, and the end, without transferring
+the object.
 
 VP9, AV1, Opus, AC-3, E-AC-3, TrueHD, and DTS are identified. They are not
 decoded. Saying otherwise would be a lie: Apple does not ship those decoders

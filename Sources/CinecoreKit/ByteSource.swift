@@ -6,7 +6,7 @@ import FoundationNetworking
 /// Random-access bytes. Demuxers read the container structure. The player reads
 /// a sample when the display asks for it. Nothing here downloads a whole remote
 /// object up front.
-public protocol MediaByteSource: AnyObject {
+public protocol MediaByteSource: AnyObject, Sendable {
     var length: Int64 { get }
     func read(at offset: Int64, count: Int) throws -> Data
 }
@@ -32,7 +32,7 @@ extension MediaByteSource {
     }
 }
 
-public final class MemoryByteSource: MediaByteSource {
+public final class MemoryByteSource: MediaByteSource, @unchecked Sendable {
     private let data: Data
     public init(_ data: Data) { self.data = data }
     public var length: Int64 { Int64(data.count) }
@@ -45,7 +45,7 @@ public final class MemoryByteSource: MediaByteSource {
     }
 }
 
-public final class FileByteSource: MediaByteSource {
+public final class FileByteSource: MediaByteSource, @unchecked Sendable {
     private let handle: FileHandle
     private let lock = NSLock()
     public let length: Int64
@@ -68,30 +68,43 @@ public final class FileByteSource: MediaByteSource {
     }
 }
 
-public final class HTTPByteSource: MediaByteSource {
+public final class HTTPByteSource: MediaByteSource, @unchecked Sendable {
     public let length: Int64
     public let url: URL
+    private let bridge: HTTPBridge
     private let session: URLSession
+    private let timeout: TimeInterval
     private let lock = NSLock()
     private var blocks: [Int64: Data] = [:]
     private var order: [Int64] = []
     private let blockSize = 256 * 1024
     private let maxBlocks = 48
 
+    /// One session for the life of the source. Range reads are tasks on that
+    /// session, so TLS and the CDN connection stay up across samples.
     public init(url: URL, timeout: TimeInterval = 20) throws {
         self.url = url
+        self.timeout = timeout
+        let bridge = HTTPBridge()
         let config = URLSessionConfiguration.ephemeral
         config.urlCache = nil
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = timeout
-        config.timeoutIntervalForResource = timeout
-        session = URLSession(configuration: config)
-        length = try HTTPByteSource.probeLength(url: url, session: session, timeout: timeout)
+        config.timeoutIntervalForResource = max(timeout, 60)
+        config.httpMaximumConnectionsPerHost = 4
+        config.httpShouldSetCookies = false
+        let session = URLSession(configuration: config, delegate: bridge, delegateQueue: nil)
+        self.bridge = bridge
+        self.session = session
+        length = try Self.probeLength(url: url, session: session, bridge: bridge, timeout: timeout)
         if length <= 0 { throw CinecoreError("Remote object has no length.") }
     }
 
+    deinit { session.invalidateAndCancel() }
+
     public func read(at offset: Int64, count: Int) throws -> Data {
-        guard offset >= 0, count > 0, offset < length else { return Data() }
+        guard offset >= 0, count > 0 else { return Data() }
+        if offset >= length { return Data() }
         let n = Int(min(Int64(count), length - offset))
         if n > blockSize * 4 { return try fetch(offset, n) }
         var out = Data()
@@ -103,10 +116,18 @@ public final class HTTPByteSource: MediaByteSource {
             let start = index * Int64(blockSize)
             let chunk = try block(index, start)
             let inner = Int(pos - start)
-            if inner >= chunk.count { break }
+            if inner < 0 || inner >= chunk.count {
+                throw CinecoreError("Short range response at byte \(pos): got \(out.count) of \(n).")
+            }
             let take = min(chunk.count - inner, Int(end - pos))
+            if take <= 0 {
+                throw CinecoreError("Short range response at byte \(pos): got \(out.count) of \(n).")
+            }
             out.append(chunk.subdata(in: inner ..< (inner + take)))
             pos += Int64(take)
+        }
+        if out.count != n {
+            throw CinecoreError("Short range response: got \(out.count) of \(n) bytes at \(offset).")
         }
         return out
     }
@@ -132,87 +153,71 @@ public final class HTTPByteSource: MediaByteSource {
     }
 
     private func fetch(_ offset: Int64, _ count: Int) throws -> Data {
-        let task = RangeTask()
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: url, timeoutInterval: timeout)
         request.setValue("bytes=\(offset)-\(offset + Int64(count) - 1)", forHTTPHeaderField: "Range")
-        let session = URLSession(configuration: self.session.configuration, delegate: task, delegateQueue: nil)
-        defer { session.finishTasksAndInvalidate() }
-        session.dataTask(with: request).resume()
-        if task.sem.wait(timeout: .now() + 30) == .timedOut {
-            throw CinecoreError("Timed out reading \(url.host ?? "remote") at byte \(offset).")
-        }
-        if task.status != 206 {
-            throw CinecoreError("Server did not honor the byte range (HTTP \(task.status)). A 60 GB remux cannot be pulled in one response.")
-        }
-        if let failure = task.error { throw failure }
-        return task.body
+        return try perform(request, expect: count, allow: [206])
     }
 
-    private static func probeLength(url: URL, session: URLSession, timeout: TimeInterval) throws -> Int64 {
+    private func perform(_ request: URLRequest, expect: Int?, allow: Set<Int>) throws -> Data {
+        let transfer = Transfer(expect: expect, allow: allow)
+        let task = session.dataTask(with: request)
+        bridge.track(task.taskIdentifier, transfer)
+        task.resume()
+        if transfer.sem.wait(timeout: .now() + timeout + 5) == .timedOut {
+            task.cancel()
+            throw CinecoreError("Timed out reading \(url.host ?? "remote").")
+        }
+        bridge.forget(task.taskIdentifier)
+        let snap = transfer.snapshot()
+        if let failure = snap.failure { throw failure }
+        if !allow.contains(snap.status) {
+            throw CinecoreError("Server did not honor the byte range (HTTP \(snap.status)). A 60 GB remux cannot be pulled in one response.")
+        }
+        if let expect, snap.body.count != expect {
+            throw CinecoreError("Short range response: got \(snap.body.count) of \(expect) bytes.")
+        }
+        return snap.body
+    }
+
+    private static func probeLength(url: URL, session: URLSession, bridge: HTTPBridge, timeout: TimeInterval) throws -> Int64 {
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = "HEAD"
-        let sem = DispatchSemaphore(value: 0)
-        let probe = ProbeBox()
-        session.dataTask(with: request) { _, response, error in
-            probe.finish(response, error)
-            sem.signal()
-        }.resume()
-        if sem.wait(timeout: .now() + timeout) == .timedOut {
+        let transfer = Transfer(expect: nil, allow: [200])
+        let task = session.dataTask(with: request)
+        bridge.track(task.taskIdentifier, transfer)
+        task.resume()
+        if transfer.sem.wait(timeout: .now() + timeout) == .timedOut {
+            task.cancel()
             throw CinecoreError("Timed out asking for the length of \(url.absoluteString).")
         }
-        let (length, failure) = probe.result()
-        if length > 0 { return length }
-        if let failure { throw failure }
+        bridge.forget(task.taskIdentifier)
+        let snap = transfer.snapshot()
+        if let failure = snap.failure { throw failure }
+        if snap.length > 0 { return snap.length }
         throw CinecoreError("The server did not say how long \(url.lastPathComponent) is.")
     }
 }
 
-private final class ProbeBox: @unchecked Sendable {
+private final class HTTPBridge: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let lock = NSLock()
-    private var length: Int64 = -1
-    private var failure: Error?
+    private var inflight: [Int: Transfer] = [:]
 
-    func finish(_ response: URLResponse?, _ error: Error?) {
+    func track(_ id: Int, _ transfer: Transfer) {
         lock.lock()
-        defer { lock.unlock() }
-        if let http = response as? HTTPURLResponse,
-           let raw = http.value(forHTTPHeaderField: "Content-Length"),
-           let n = Int64(raw), n > 0 {
-            length = n
-        }
-        failure = error
+        inflight[id] = transfer
+        lock.unlock()
     }
 
-    func result() -> (Int64, Error?) {
+    func forget(_ id: Int) {
         lock.lock()
-        defer { lock.unlock() }
-        return (length, failure)
-    }
-}
-
-private final class RangeTask: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-    let sem = DispatchSemaphore(value: 0)
-    private let lock = NSLock()
-    private var storage = Data()
-    private var statusCode = 0
-    private var failure: Error?
-
-    var status: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return statusCode
+        inflight[id] = nil
+        lock.unlock()
     }
 
-    var body: Data {
+    private func find(_ task: URLSessionTask) -> Transfer? {
         lock.lock()
         defer { lock.unlock() }
-        return storage
-    }
-
-    var error: Error? {
-        lock.lock()
-        defer { lock.unlock() }
-        return failure
+        return inflight[task.taskIdentifier]
     }
 
     func urlSession(
@@ -221,29 +226,79 @@ private final class RangeTask: NSObject, URLSessionDataDelegate, @unchecked Send
         didReceive response: URLResponse,
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
-        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-        lock.lock()
-        statusCode = code
-        lock.unlock()
-        completionHandler(code == 206 ? .allow : .cancel)
+        guard let http = response as? HTTPURLResponse, let transfer = find(dataTask) else {
+            completionHandler(.cancel)
+            return
+        }
+        completionHandler(transfer.noteResponse(http))
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        find(dataTask)?.append(data)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        find(task)?.finish(error)
+    }
+}
+
+private final class Transfer: @unchecked Sendable {
+    let sem = DispatchSemaphore(value: 0)
+    /// Nil skips the body-length check. Used for HEAD.
+    let expect: Int?
+    let allow: Set<Int>
+    private let lock = NSLock()
+    private var storage = Data()
+    private var statusCode = 0
+    private var headerLength: Int64 = -1
+    private var failure: Error?
+    private var signaled = false
+
+    init(expect: Int?, allow: Set<Int>) {
+        self.expect = expect
+        self.allow = allow
+    }
+
+    func noteResponse(_ response: HTTPURLResponse) -> URLSession.ResponseDisposition {
+        lock.lock()
+        statusCode = response.statusCode
+        if let raw = response.value(forHTTPHeaderField: "Content-Length"), let n = Int64(raw), n >= 0 {
+            headerLength = n
+        }
+        let ok = allow.contains(response.statusCode)
+        lock.unlock()
+        return ok ? .allow : .cancel
+    }
+
+    func append(_ data: Data) {
         lock.lock()
         storage.append(data)
         lock.unlock()
     }
 
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    func finish(_ error: Error?) {
+        lock.lock()
         if let error {
             let ns = error as NSError
-            if ns.code != NSURLErrorCancelled {
-                lock.lock()
-                failure = error
-                lock.unlock()
-            }
+            let cancelled = ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled
+            if !cancelled && failure == nil { failure = error }
         }
-        sem.signal()
+        if failure == nil && !allow.contains(statusCode) {
+            failure = CinecoreError("Server did not honor the byte range (HTTP \(statusCode)).")
+        }
+        if failure == nil, let expect, storage.count != expect {
+            failure = CinecoreError("Short range response: got \(storage.count) of \(expect) bytes.")
+        }
+        let already = signaled
+        signaled = true
+        lock.unlock()
+        if !already { sem.signal() }
+    }
+
+    func snapshot() -> (status: Int, body: Data, length: Int64, failure: Error?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (statusCode, storage, headerLength, failure)
     }
 }
 
