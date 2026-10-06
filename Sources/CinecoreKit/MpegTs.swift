@@ -12,20 +12,21 @@ struct TsResult {
 
 private struct Es { var type: Int; var pid: Int; var lang: String? }
 
-func parseTs(_ source: Data) -> TsResult {
+func parseTs(_ source: MediaByteSource) -> TsResult {
     var warnings: [String] = []
     var log: [String] = []
+    let file = ByteWindow(source)
     var packetSize = 188
     var headerSkip = 0
-    if source.count > 188 && source[0] == 0x47 && source[188] == 0x47 {
+    if file.count > 188 && file[0] == 0x47 && file[188] == 0x47 {
         packetSize = 188
-    } else if source.count > 196 && source[4] == 0x47 && source[196] == 0x47 {
+    } else if file.count > 196 && file[4] == 0x47 && file[196] == 0x47 {
         packetSize = 192
         headerSkip = 4
     } else {
         warnings.append("Transport stream sync was not on a 188 or 192-byte grid. Trying 188.")
     }
-    let programs = scanPsi(source, packetSize, headerSkip)
+    let programs = scanPsi(file, packetSize, headerSkip)
     if programs.isEmpty { warnings.append("No program map. Elementary streams could not be assigned.") }
     let videoEs = programs.first { $0.type == 0x1b || $0.type == 0x24 }
     let audioEs = programs.first { $0.type == 0x0f || $0.type == 0x11 || $0.type == 0x81 || $0.type == 0x87 }
@@ -45,29 +46,29 @@ func parseTs(_ source: Data) -> TsResult {
         pesStart = -1
     }
     var offset = 0
-    while offset + packetSize <= source.count {
+    while offset + packetSize <= file.count {
         let base = offset + headerSkip
-        if source[base] == 0x47 {
-            let pid = ((Int(source[base + 1]) & 0x1f) << 8) | Int(source[base + 2])
-            let pusi = (Int(source[base + 1]) & 0x40) != 0
-            let adapt = (Int(source[base + 3]) >> 4) & 3
+        if file[base] == 0x47 {
+            let pid = ((Int(file[base + 1]) & 0x1f) << 8) | Int(file[base + 2])
+            let pusi = (Int(file[base + 1]) & 0x40) != 0
+            let adapt = (Int(file[base + 3]) >> 4) & 3
             if !pusi && pesStart >= 0, let videoEs, pid == videoEs.pid && pid == pesPid && !pesKey {
-                let mid = payloadOffset(source, base, adapt)
+                let mid = payloadOffset(count: file.count, base, adapt) { file[$0] }
                 if mid >= 0 {
-                    let slice = source.subdata(in: (base + mid) ..< min(source.count, offset + packetSize))
+                    let slice = file.subdata(in: (base + mid) ..< min(file.count, offset + packetSize))
                     if hasIdr(slice, videoEs.type == 0x24) { pesKey = true }
                 }
             }
             if pusi && (pid == videoEs?.pid || pid == audioEs?.pid) {
                 flush(offset)
-                let payloadOff = payloadOffset(source, base, adapt)
-                let pts = payloadOff >= 0 ? readPts(source.subdata(in: (base + payloadOff) ..< min(source.count, offset + packetSize))) : nil
+                let payloadOff = payloadOffset(count: file.count, base, adapt) { file[$0] }
+                let pts = payloadOff >= 0 ? readPts(file.subdata(in: (base + payloadOff) ..< min(file.count, offset + packetSize))) : nil
                 pesStart = offset
                 pesPid = pid
                 pesPts = pts ?? videoSamples.last?.pts ?? 0
                 pesKey = false
                 if let videoEs, pid == videoEs.pid, payloadOff >= 0 {
-                    let slice = source.subdata(in: (base + payloadOff) ..< min(source.count, offset + packetSize))
+                    let slice = file.subdata(in: (base + payloadOff) ..< min(file.count, offset + packetSize))
                     pesKey = hasIdr(slice, videoEs.type == 0x24)
                 }
             }
@@ -155,7 +156,7 @@ func parseTs(_ source: Data) -> TsResult {
     return TsResult(packetSize: packetSize, headerSkip: headerSkip, duration: duration, video: videoOut, audio: audioOut, warnings: warnings, log: log)
 }
 
-private func scanPsi(_ source: Data, _ packetSize: Int, _ headerSkip: Int) -> [Es] {
+private func scanPsi(_ source: ByteWindow, _ packetSize: Int, _ headerSkip: Int) -> [Es] {
     let windowCount = min(source.count, packetSize * 4000)
     var pmtPid = -1
     var streams: [Es] = []
@@ -167,7 +168,7 @@ private func scanPsi(_ source: Data, _ packetSize: Int, _ headerSkip: Int) -> [E
             let pusi = (Int(source[base + 1]) & 0x40) != 0
             let adapt = (Int(source[base + 3]) >> 4) & 3
             if pusi {
-                let payloadAt = payloadOffset(source, base, adapt)
+                let payloadAt = payloadOffset(count: source.count, base, adapt) { source[$0] }
                 if payloadAt >= 0 {
                     let payload = source.subdata(in: (base + payloadAt) ..< min(source.count, o + packetSize))
                     if pid == 0 && pmtPid < 0 { pmtPid = readPat(payload) }
@@ -234,11 +235,11 @@ private func readPmt(_ payload: Data) -> [Es] {
     return out
 }
 
-private func payloadOffset(_ buf: Data, _ base: Int, _ adapt: Int) -> Int {
+private func payloadOffset(count: Int, _ base: Int, _ adapt: Int, _ byte: (Int) -> UInt8) -> Int {
     if adapt == 1 { return 4 }
     if adapt == 3 || adapt == 2 {
-        if base + 4 >= buf.count { return -1 }
-        return 5 + Int(buf[base + 4])
+        if base + 4 >= count { return -1 }
+        return 5 + Int(byte(base + 4))
     }
     return -1
 }
@@ -273,10 +274,13 @@ private func fillDurations(_ samples: inout [SampleRec], _ fallback: Double) {
     }
 }
 
-func extractPes(_ source: Data, _ offset: Int, _ size: Int, _ packetSize: Int, _ headerSkip: Int) -> Data {
-    let end = min(source.count, offset + size)
-    if offset < 0 || offset >= end { return Data() }
-    let raw = source.subdata(in: offset ..< end)
+func extractPes(_ source: MediaByteSource, _ offset: Int, _ size: Int, _ packetSize: Int, _ headerSkip: Int) -> Data {
+    if offset < 0 || size <= 0 { return Data() }
+    let raw = source.readOrEmpty(at: Int64(offset), count: size)
+    return extractPesBytes(raw, packetSize, headerSkip)
+}
+
+private func extractPesBytes(_ raw: Data, _ packetSize: Int, _ headerSkip: Int) -> Data {
     var parts: [Data] = []
     var first = true
     var o = 0
@@ -284,7 +288,7 @@ func extractPes(_ source: Data, _ offset: Int, _ size: Int, _ packetSize: Int, _
         let base = o + headerSkip
         if raw[base] == 0x47 {
             let adapt = (Int(raw[base + 3]) >> 4) & 3
-            let payloadAt = payloadOffset(raw, base, adapt)
+            let payloadAt = payloadOffset(count: raw.count, base, adapt) { raw[$0] }
             if payloadAt >= 0 && base + payloadAt < o + packetSize {
                 var slice = raw.subdata(in: (base + payloadAt) ..< (o + packetSize))
                 if first {
@@ -327,7 +331,7 @@ private func splitAdts(_ data: Data) -> [Adts] {
     return out
 }
 
-private func expandAac(_ source: Data, _ pes: [SampleRec], _ packetSize: Int, _ headerSkip: Int) -> [SampleRec] {
+private func expandAac(_ source: MediaByteSource, _ pes: [SampleRec], _ packetSize: Int, _ headerSkip: Int) -> [SampleRec] {
     var frames: [SampleRec] = []
     for sample in pes {
         let body = extractPes(source, sample.offset, sample.size, packetSize, headerSkip)

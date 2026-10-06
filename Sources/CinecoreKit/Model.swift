@@ -120,7 +120,8 @@ public struct LoadedTrack {
 
 public struct LoadedMedia {
     public var info: MediaInfo
-    public var data: Data
+    /// Backing bytes. Sample payloads stay here until the player asks for one.
+    public var source: any MediaByteSource
     public var video: LoadedTrack?
     public var audio: LoadedTrack?
     /// MPEG-TS packet size, when the container is a transport stream.

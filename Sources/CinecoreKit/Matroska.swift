@@ -124,23 +124,35 @@ struct MkvResult {
     var log: [String]
 }
 
-func parseMatroska(_ source: Data, webm: Bool) -> Result<MkvResult, CinecoreError> {
+private func peekId(_ source: MediaByteSource, _ offset: Int64) -> IdSize? {
+    if offset < 0 || offset >= source.length { return nil }
+    let window = source.readOrEmpty(at: offset, count: 16)
+    return readIdSize(window, 0)
+}
+
+func parseMatroska(_ source: MediaByteSource, webm: Bool) -> Result<MkvResult, CinecoreError> {
     var warnings: [String] = []
     var log: [String] = []
-    guard let top = readIdSize(source, 0), top.id == 0x1a45dfa3 else {
+    let fileLength = source.length
+    guard let top = peekId(source, 0), top.id == 0x1a45dfa3 else {
         return .failure(CinecoreError("Not an EBML file."))
     }
-    let ebmlEnd = top.idLen + top.sizeLen + (top.size ?? 0)
+    let ebmlPayload = Int64(top.idLen + top.sizeLen)
+    let ebmlSize = Int64(top.size ?? 0)
+    let ebmlEnd = ebmlPayload + ebmlSize
     var docType = "matroska"
-    for el in elements(source, top.idLen + top.sizeLen, min(source.count, ebmlEnd)) where el.id == 0x4282 {
-        docType = textOf(source.subdata(in: el.start ..< el.end))
+    if ebmlSize > 0 && ebmlSize < 1_000_000 {
+        let ebml = source.readOrEmpty(at: ebmlPayload, count: Int(ebmlSize))
+        for el in elements(ebml, 0, ebml.count) where el.id == 0x4282 {
+            docType = textOf(ebml.subdata(in: el.start ..< el.end))
+        }
     }
     var o = ebmlEnd
-    guard let seg = readIdSize(source, o), seg.id == MID.segment else {
+    guard let seg = peekId(source, o), seg.id == MID.segment else {
         return .failure(CinecoreError("Matroska segment is missing."))
     }
-    let segmentData = o + seg.idLen + seg.sizeLen
-    let segmentEnd = seg.size == nil ? source.count : min(source.count, segmentData + (seg.size ?? 0))
+    let segmentData = o + Int64(seg.idLen + seg.sizeLen)
+    let segmentEnd = seg.size == nil ? fileLength : min(fileLength, segmentData + Int64(seg.size ?? 0))
     o = segmentData
     var scale = 1_000_000
     var duration = 0.0
@@ -149,21 +161,21 @@ func parseMatroska(_ source: Data, webm: Bool) -> Result<MkvResult, CinecoreErro
     var guardN = 0
     while o + 2 < segmentEnd && guardN < 4000 {
         guardN += 1
-        guard let h = readIdSize(source, o) else { break }
-        let headerLen = h.idLen + h.sizeLen
+        guard let h = peekId(source, o) else { break }
+        let headerLen = Int64(h.idLen + h.sizeLen)
         let dataStart = o + headerLen
         if h.size == nil { break }
-        let payload = h.size ?? 0
-        if h.id == MID.info && payload < 1_000_000 {
-            let buf = source.subdata(in: dataStart ..< min(source.count, dataStart + payload))
+        let payload = Int64(h.size ?? 0)
+        if h.id == MID.info && payload > 0 && payload < 1_000_000 {
+            let buf = source.readOrEmpty(at: dataStart, count: Int(payload))
             for el in elements(buf, 0, buf.count) {
                 let raw = buf.subdata(in: el.start ..< el.end)
                 if el.id == MID.timestampScale { scale = uintOf(raw) == 0 ? scale : uintOf(raw) }
                 if el.id == MID.duration { duration = (floatOf(raw) * Double(scale)) / 1e9 }
                 if el.id == MID.title { title = textOf(raw) }
             }
-        } else if h.id == MID.tracks && payload < 8_000_000 {
-            let buf = source.subdata(in: dataStart ..< min(source.count, dataStart + payload))
+        } else if h.id == MID.tracks && payload > 0 && payload < 8_000_000 {
+            let buf = source.readOrEmpty(at: dataStart, count: Int(payload))
             for el in elements(buf, 0, buf.count) where el.id == MID.track {
                 if let built = buildMkTrack(buf, el) { drafts.append(built) }
             }
@@ -181,18 +193,19 @@ func parseMatroska(_ source: Data, webm: Bool) -> Result<MkvResult, CinecoreErro
     var clusterAt = o
     var clusters = 0
     while clusterAt + 2 < segmentEnd && clusters < 200_000 {
-        guard let h = readIdSize(source, clusterAt) else { break }
-        let headerLen = h.idLen + h.sizeLen
+        guard let h = peekId(source, clusterAt) else { break }
+        let headerLen = Int64(h.idLen + h.sizeLen)
         if h.size == nil { break }
+        let payload = Int64(h.size ?? 0)
         if h.id != MID.cluster {
-            clusterAt = clusterAt + headerLen + (h.size ?? 0)
+            clusterAt = clusterAt + headerLen + payload
             continue
         }
         let payloadStart = clusterAt + headerLen
-        let payloadEnd = min(source.count, payloadStart + (h.size ?? 0))
-        if payloadStart < payloadEnd {
-            let payload = source.subdata(in: payloadStart ..< payloadEnd)
-            let frames = parseCluster(payload, payloadStart, scale, drafts)
+        if payload > 0 && payload < 512_000_000 && payloadStart < fileLength {
+            let n = Int(min(payload, fileLength - payloadStart))
+            let blob = source.readOrEmpty(at: payloadStart, count: n)
+            let frames = parseCluster(blob, Int(payloadStart), scale, drafts)
             for frame in frames {
                 samplesByTrack[frame.track, default: []].append(SampleRec(
                     pts: frame.pts, duration: frame.duration, key: frame.key, offset: frame.offset, size: frame.size, inline: nil
@@ -200,7 +213,7 @@ func parseMatroska(_ source: Data, webm: Bool) -> Result<MkvResult, CinecoreErro
             }
         }
         clusters += 1
-        clusterAt = payloadEnd
+        clusterAt = payloadStart + payload
     }
     if clusters == 0 { warnings.append("No cluster found. There is nothing to decode.") }
     var tracks: [LoadedTrack] = []

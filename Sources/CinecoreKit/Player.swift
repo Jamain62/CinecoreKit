@@ -33,7 +33,12 @@ public final class CinecorePlayer: NSObject, ObservableObject {
     private var nalLength = 4
     private var family: VideoFamily = .other
     private var audioAttached = false
-    private var started = false
+    private var feeding = false
+    private var feedGeneration = 0
+    private var videoCursor = 0
+    private var audioCursor = 0
+    private let mediaQueue = DispatchQueue(label: "cinecore.samples")
+    private let cursorLock = NSLock()
     private var ticker: Timer?
 
     public override init() {
@@ -47,21 +52,48 @@ public final class CinecorePlayer: NSObject, ObservableObject {
     }
 
     public func open(data: Data, name: String) {
+        adopt(CinecoreOpen.open(data: data, name: name))
+    }
+
+    public func open(fileURL: URL) {
+        do {
+            adopt(try CinecoreOpen.open(fileURL: fileURL))
+        } catch {
+            lastError = error.localizedDescription
+            detail = lastError ?? "Unreadable file."
+        }
+    }
+
+    public func open(remote url: URL) {
+        do {
+            adopt(try CinecoreOpen.open(remote: url))
+        } catch {
+            lastError = error.localizedDescription
+            detail = lastError ?? "Remote open failed."
+        }
+    }
+
+    private func adopt(_ opened: LoadedMedia) {
+        stopFeeding()
         stopTicker()
         sync.rate = 0
         display.flush()
         audioRenderer.flush()
-        media = CinecoreOpen.open(data: data, name: name)
-        info = media?.info
-        duration = media?.info.duration ?? 0
+        cursorLock.lock()
+        media = opened
+        cursorLock.unlock()
+        info = opened.info
+        duration = opened.info.duration
         time = 0
         playing = false
         lastError = nil
         videoFormat = nil
         audioFormat = nil
-        guard let media, let video = media.video, let setup = video.video else {
+        videoCursor = 0
+        audioCursor = 0
+        guard let video = opened.video, let setup = video.video else {
             decodePath = "metadata"
-            detail = media?.info.warnings.first ?? "No picture track."
+            detail = opened.info.warnings.first ?? "No picture track."
             return
         }
         family = setup.family
@@ -83,29 +115,19 @@ public final class CinecorePlayer: NSObject, ObservableObject {
             decodePath = "ImageIO"
             detail = "Motion JPEG"
             if let first = video.samples.first {
-                view.show(jpeg: sampleBytes(media, first))
+                view.show(jpeg: sampleBytes(opened, first))
             }
         default:
             decodePath = "metadata"
             detail = "\(video.report.codecLabel) was demuxed. This engine does not include a \(setup.family.rawValue) decoder."
             lastError = detail
         }
-        if let audio = media.audio, audio.playableAudio, let setup = audio.audio, setup.codecs.first?.hasPrefix("mp4a") == true {
+        if let audio = opened.audio, audio.playableAudio, let setup = audio.audio, setup.codecs.first?.hasPrefix("mp4a") == true {
             audioFormat = makeAudioFormat(setup)
             if audioFormat != nil && !audioAttached {
                 sync.addRenderer(audioRenderer)
                 audioAttached = true
             }
-        }
-    }
-
-    public func open(fileURL: URL) {
-        do {
-            let data = try Data(contentsOf: fileURL, options: [.mappedIfSafe])
-            open(data: data, name: fileURL.lastPathComponent)
-        } catch {
-            lastError = error.localizedDescription
-            detail = lastError ?? "Unreadable file."
         }
     }
 
@@ -119,10 +141,7 @@ public final class CinecorePlayer: NSObject, ObservableObject {
             startTicker()
             return
         }
-        if !started {
-            enqueue(from: time, media: media)
-            started = true
-        }
+        if !feeding { startFeeding(from: time) }
         sync.rate = 1
         playing = true
         startTicker()
@@ -140,15 +159,14 @@ public final class CinecorePlayer: NSObject, ObservableObject {
     public func seek(to seconds: Double) {
         let target = max(0, min(seconds, duration))
         time = target
-        guard let media, videoFormat != nil else { return }
+        guard videoFormat != nil else { return }
         let was = playing
         sync.rate = 0
+        stopFeeding()
         display.flush()
         audioRenderer.flush()
         sync.setRate(0, time: CMTime(seconds: target, preferredTimescale: 600))
-        started = false
-        enqueue(from: target, media: media)
-        started = true
+        startFeeding(from: target)
         if was {
             sync.rate = 1
             playing = true
@@ -157,49 +175,126 @@ public final class CinecorePlayer: NSObject, ObservableObject {
 
     public func close() {
         pause()
+        stopFeeding()
         display.flush()
         audioRenderer.flush()
+        cursorLock.lock()
         media = nil
+        cursorLock.unlock()
         info = nil
         videoFormat = nil
-        started = false
+        audioFormat = nil
         decodePath = "not open"
         detail = "Standby"
         time = 0
         duration = 0
     }
 
-    private func enqueue(from start: Double, media: LoadedMedia) {
-        guard let format = videoFormat, let track = media.video else { return }
-        var begin = 0
+    private func startFeeding(from start: Double) {
+        guard let media, let track = media.video else { return }
+        cursorLock.lock()
+        feedGeneration += 1
+        let generation = feedGeneration
+        videoCursor = 0
         for (index, sample) in track.samples.enumerated() where sample.key && sample.pts <= start + 0.0008 {
-            begin = index
+            videoCursor = index
         }
-        let end = min(track.samples.count, begin + 240)
-        for sample in track.samples[begin ..< end] {
+        audioCursor = 0
+        if let audio = media.audio {
+            for (index, sample) in audio.samples.enumerated() where sample.pts + sample.duration >= start {
+                audioCursor = index
+                break
+            }
+        }
+        cursorLock.unlock()
+        feeding = true
+        display.requestMediaDataWhenReady(on: mediaQueue) { [weak self] in
+            self?.supplyVideo(generation)
+        }
+        if audioFormat != nil {
+            audioRenderer.requestMediaDataWhenReady(on: mediaQueue) { [weak self] in
+                self?.supplyAudio(generation)
+            }
+        }
+    }
+
+    private func stopFeeding() {
+        display.stopRequestingMediaData()
+        audioRenderer.stopRequestingMediaData()
+        cursorLock.lock()
+        feedGeneration += 1
+        cursorLock.unlock()
+        feeding = false
+    }
+
+    private func supplyVideo(_ generation: Int) {
+        guard let format = videoFormat else {
+            display.stopRequestingMediaData()
+            return
+        }
+        if display.status == .failed { display.flush() }
+        while display.isReadyForMoreMediaData {
+            cursorLock.lock()
+            if generation != feedGeneration {
+                cursorLock.unlock()
+                return
+            }
+            guard let media, let track = media.video else {
+                cursorLock.unlock()
+                display.stopRequestingMediaData()
+                return
+            }
+            if videoCursor >= track.samples.count {
+                cursorLock.unlock()
+                display.stopRequestingMediaData()
+                return
+            }
+            let sample = track.samples[videoCursor]
+            videoCursor += 1
+            cursorLock.unlock()
             let bytes = normalize(sampleBytes(media, sample))
             guard !bytes.isEmpty, let buffer = makeVideoBuffer(bytes, sample, format) else { continue }
             display.enqueue(buffer)
         }
-        if let audioFormat, let audio = media.audio, audio.playableAudio {
-            for sample in audio.samples where sample.pts + sample.duration >= start {
-                let bytes = sampleBytes(media, sample)
-                guard !bytes.isEmpty, let buffer = makeAudioBuffer(bytes, sample, audioFormat) else { continue }
-                audioRenderer.enqueue(buffer)
-                if sample.pts > start + 8 { break }
+    }
+
+    private func supplyAudio(_ generation: Int) {
+        guard let format = audioFormat else {
+            audioRenderer.stopRequestingMediaData()
+            return
+        }
+        while audioRenderer.isReadyForMoreMediaData {
+            cursorLock.lock()
+            if generation != feedGeneration {
+                cursorLock.unlock()
+                return
             }
+            guard let media, let track = media.audio, track.playableAudio else {
+                cursorLock.unlock()
+                audioRenderer.stopRequestingMediaData()
+                return
+            }
+            if audioCursor >= track.samples.count {
+                cursorLock.unlock()
+                audioRenderer.stopRequestingMediaData()
+                return
+            }
+            let sample = track.samples[audioCursor]
+            audioCursor += 1
+            cursorLock.unlock()
+            let bytes = sampleBytes(media, sample)
+            guard !bytes.isEmpty, let buffer = makeAudioBuffer(bytes, sample, format) else { continue }
+            audioRenderer.enqueue(buffer)
         }
     }
 
     private func sampleBytes(_ media: LoadedMedia, _ sample: SampleRec) -> Data {
         if let inline = sample.inline { return inline }
+        if sample.offset < 0 || sample.size <= 0 { return Data() }
         if media.info.container == "ts", let packet = media.packetSize, let skip = media.headerSkip {
-            return extractPes(media.data, sample.offset, sample.size, packet, skip)
+            return extractPes(media.source, sample.offset, sample.size, packet, skip)
         }
-        let start = max(0, sample.offset)
-        let end = min(media.data.count, start + max(0, sample.size))
-        if start >= end { return Data() }
-        return media.data.subdata(in: start ..< end)
+        return media.source.readOrEmpty(at: Int64(sample.offset), count: sample.size)
     }
 
     private func normalize(_ data: Data) -> Data {

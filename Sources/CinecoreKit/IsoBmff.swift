@@ -9,18 +9,20 @@ struct IsoResult {
     var log: [String]
 }
 
-func parseIso(_ source: Data) -> IsoResult {
+func parseIso(_ source: MediaByteSource) -> IsoResult {
     var warnings: [String] = []
     var log: [String] = []
     var brands: [String] = []
     var movie: Data?
     var moofs: [(Data, Int)] = []
-    var offset = 0
-    while offset + 8 <= source.count {
-        guard let header = headerAt(source, offset) else { break }
+    let fileLength = source.length
+    var offset: Int64 = 0
+    while offset + 8 <= fileLength {
+        guard let header = readTop(source, offset, fileLength) else { break }
         if header.total < 8 { break }
+        let bodyLen = header.total - header.header
         if header.type == "ftyp" {
-            let body = Bytes.slice(source, offset + header.header, offset + min(header.total, header.header + 256))
+            let body = source.readOrEmpty(at: offset + header.header, count: Int(min(bodyLen, 256)))
             brands = [Bytes.fourcc(body, 0)]
             var i = 8
             while i + 4 <= body.count {
@@ -29,17 +31,15 @@ func parseIso(_ source: Data) -> IsoResult {
             }
             log.append("ftyp \(brands.filter { !$0.isEmpty }.joined(separator: " "))")
         } else if header.type == "moov" {
-            let size = header.total - header.header
-            if size > 80_000_000 { warnings.append("Movie header is unusually large; sample index may be partial.") }
-            movie = Bytes.slice(source, offset + header.header, offset + header.header + min(size, 80_000_000))
+            if bodyLen > 80_000_000 { warnings.append("Movie header is unusually large; sample index may be partial.") }
+            movie = source.readOrEmpty(at: offset + header.header, count: Int(min(bodyLen, 80_000_000)))
         } else if header.type == "moof" {
-            let size = header.total - header.header
-            if size > 0 && size < 8_000_000 {
-                moofs.append((Bytes.slice(source, offset + header.header, offset + header.total), offset))
+            if bodyLen > 0 && bodyLen < 8_000_000 {
+                moofs.append((source.readOrEmpty(at: offset + header.header, count: Int(bodyLen)), Int(offset)))
             }
         }
         let next = offset + header.total
-        if next <= offset || next > source.count { break }
+        if next <= offset { break }
         offset = next
     }
     guard let movie else {
@@ -94,24 +94,25 @@ func parseIso(_ source: Data) -> IsoResult {
     return IsoResult(format: format, brands: clean, duration: duration, tracks: tracks, warnings: warnings, log: log)
 }
 
-private struct Header { var type: String; var header: Int; var total: Int }
+private struct TopBox { var type: String; var header: Int64; var total: Int64 }
 
-private func headerAt(_ source: Data, _ offset: Int) -> Header? {
-    if offset < 0 || offset + 8 > source.count { return nil }
-    let h = Bytes.slice(source, offset, offset + 16)
+private func readTop(_ source: MediaByteSource, _ offset: Int64, _ fileLength: Int64) -> TopBox? {
+    if offset < 0 || offset + 8 > fileLength { return nil }
+    let h = source.readOrEmpty(at: offset, count: 16)
     if h.count < 8 { return nil }
     let size32 = Bytes.u32(h, 0)
     let type = Bytes.fourcc(h, 4)
-    if type.count != 4 || type.contains(where: { !$0.isASCII || $0.asciiValue! < 32 || $0.asciiValue! > 126 }) { return nil }
+    if type.count != 4 { return nil }
+    for byte in type.utf8 where byte < 32 || byte > 126 { return nil }
     if size32 == 1 {
         if h.count < 16 { return nil }
-        let total = Bytes.u64(h, 8)
+        let total = Int64(Bytes.u64(h, 8))
         if total < 16 { return nil }
-        return Header(type: type, header: 16, total: total)
+        return TopBox(type: type, header: 16, total: total)
     }
-    if size32 == 0 { return Header(type: type, header: 8, total: source.count - offset) }
+    if size32 == 0 { return TopBox(type: type, header: 8, total: fileLength - offset) }
     if size32 < 8 { return nil }
-    return Header(type: type, header: 8, total: size32)
+    return TopBox(type: type, header: 8, total: Int64(size32))
 }
 
 private func langOf(_ code: Int) -> String? {
@@ -559,7 +560,7 @@ private func appendFragments(_ moof: Data, _ moofOffset: Int, _ tracks: inout [L
     }
 }
 
-func enrichIsoHdr(_ source: Data, _ result: inout IsoResult) {
+func enrichIsoHdr(_ source: MediaByteSource, _ result: inout IsoResult) {
     for i in result.tracks.indices {
         guard result.tracks[i].report.kind == .video, let video = result.tracks[i].video else { continue }
         if video.family != .avc && video.family != .hevc { continue }
@@ -576,9 +577,11 @@ func enrichIsoHdr(_ source: Data, _ result: inout IsoResult) {
         for sample in keys + extra {
             if seen.contains(sample.offset) || sample.size <= 0 || sample.size > 2_000_000 { continue }
             seen.insert(sample.offset)
-            let end = min(source.count, sample.offset + min(sample.size, 256_000))
-            if sample.offset < 0 || sample.offset >= end { continue }
-            scanSampleForHdr(source.subdata(in: sample.offset ..< end), video.family, lengthSize, &hdr)
+            let n = min(sample.size, 256_000)
+            if sample.offset < 0 || Int64(sample.offset) >= source.length { continue }
+            let bytes = source.readOrEmpty(at: Int64(sample.offset), count: n)
+            if bytes.isEmpty { continue }
+            scanSampleForHdr(bytes, video.family, lengthSize, &hdr)
         }
         finishHdr(&hdr)
         result.tracks[i].report.hdr = hdr

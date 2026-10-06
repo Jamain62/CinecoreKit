@@ -7,13 +7,14 @@ struct AviResult {
     var log: [String]
 }
 
-func parseAvi(_ source: Data) -> Result<AviResult, CinecoreError> {
+func parseAvi(_ source: MediaByteSource) -> Result<AviResult, CinecoreError> {
     var warnings: [String] = []
     var log: [String] = []
-    if source.count < 12 || Bytes.fourcc(source, 0) != "RIFF" || Bytes.fourcc(source, 8) != "AVI " {
+    let head = source.readOrEmpty(at: 0, count: 12)
+    if head.count < 12 || Bytes.fourcc(head, 0) != "RIFF" || Bytes.fourcc(head, 8) != "AVI " {
         return .failure(CinecoreError("Not an AVI file."))
     }
-    var offset = 12
+    var offset: Int64 = 12
     var moviAt = -1
     var scale = 1
     var rate = 24
@@ -21,16 +22,19 @@ func parseAvi(_ source: Data) -> Result<AviResult, CinecoreError> {
     var height = 0
     var handler = ""
     var samples: [SampleRec] = []
-    while offset + 8 <= source.count {
-        let id = Bytes.fourcc(source, offset)
-        let size = Bytes.le32(source, offset + 4)
+    while offset + 8 <= source.length {
+        let hdr = source.readOrEmpty(at: offset, count: 8)
+        if hdr.count < 8 { break }
+        let id = Bytes.fourcc(hdr, 0)
+        let size = Bytes.le32(hdr, 4)
         let payload = offset + 8
-        if id == "LIST" && payload + 4 <= source.count {
-            let kind = Bytes.fourcc(source, payload)
+        if id == "LIST" && payload + 4 <= source.length {
+            let kind = Bytes.fourcc(source.readOrEmpty(at: payload, count: 4), 0)
             if kind == "movi" {
-                moviAt = payload
+                moviAt = payload > Int64(Int.max) ? -1 : Int(payload)
             } else if kind == "hdrl" {
-                let hdrl = Bytes.slice(source, payload + 4, payload + min(size, 200_000))
+                let n = min(Int64(size), 200_000)
+                let hdrl = source.readOrEmpty(at: payload + 4, count: Int(max(0, n - 4)))
                 let info = readHdrl(hdrl)
                 scale = info.scale == 0 ? scale : info.scale
                 rate = info.rate == 0 ? rate : info.rate
@@ -39,7 +43,7 @@ func parseAvi(_ source: Data) -> Result<AviResult, CinecoreError> {
                 handler = info.handler.isEmpty ? handler : info.handler
             }
         } else if id == "idx1" && size > 0 && size < 40_000_000 {
-            let idx = Bytes.slice(source, payload, payload + size)
+            let idx = source.readOrEmpty(at: payload, count: size)
             let base = moviAt >= 0 ? moviAt : 0
             let entries = idx.count / 16
             let fps = Double(rate) / Double(scale == 0 ? 1 : scale)
@@ -58,10 +62,9 @@ func parseAvi(_ source: Data) -> Result<AviResult, CinecoreError> {
                 ))
             }
         }
-        let step = 8 + size + (size & 1)
+        let step = Int64(8 + size + (size & 1))
         if step < 8 { break }
         offset += step
-        if offset > source.count { break }
     }
     if samples.isEmpty && moviAt >= 0 {
         warnings.append("No idx1 index. Scanning the movie list.")
@@ -126,18 +129,20 @@ private func readHdrl(_ data: Data) -> HdrlInfo {
     return info
 }
 
-private func scanMovi(_ source: Data, _ moviPayload: Int, _ samples: inout [SampleRec], _ fps: Double) {
-    var o = moviPayload + 4
+private func scanMovi(_ source: MediaByteSource, _ moviPayload: Int, _ samples: inout [SampleRec], _ fps: Double) {
+    var o = Int64(moviPayload + 4)
     var guardN = 0
-    while o + 8 <= source.count && guardN < 200_000 {
+    while o + 8 <= source.length && guardN < 200_000 {
         guardN += 1
-        let id = Bytes.fourcc(source, o)
-        let size = Bytes.le32(source, o + 4)
+        let hdr = source.readOrEmpty(at: o, count: 8)
+        if hdr.count < 8 { break }
+        let id = Bytes.fourcc(hdr, 0)
+        let size = Bytes.le32(hdr, 4)
         if id == "idx1" || id == "JUNK" || id == "LIST" { break }
         if id.hasSuffix("dc") || id.hasSuffix("db") {
-            samples.append(SampleRec(pts: Double(samples.count) / (fps == 0 ? 24 : fps), duration: 1 / (fps == 0 ? 24 : fps), key: true, offset: o + 8, size: size, inline: nil))
+            samples.append(SampleRec(pts: Double(samples.count) / (fps == 0 ? 24 : fps), duration: 1 / (fps == 0 ? 24 : fps), key: true, offset: Int(o) + 8, size: size, inline: nil))
         }
-        let step = 8 + size + (size & 1)
+        let step = Int64(8 + size + (size & 1))
         if step < 8 { break }
         o += step
     }
