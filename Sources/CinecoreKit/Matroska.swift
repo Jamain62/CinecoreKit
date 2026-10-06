@@ -126,8 +126,23 @@ struct MkvResult {
 
 private func peekId(_ source: MediaByteSource, _ offset: Int64) -> IdSize? {
     if offset < 0 || offset >= source.length { return nil }
-    let window = source.readOrEmpty(at: offset, count: 16)
+    let window = exactBytes(source, offset, 16)
     return readIdSize(window, 0)
+}
+
+private func exactBytes(_ source: MediaByteSource, _ offset: Int64, _ count: Int) -> Data {
+    guard count > 0, offset >= 0, offset < source.length else { return Data() }
+    let n = Int(min(Int64(count), source.length - offset))
+    var delay = 0.2
+    for attempt in 0 ..< 4 {
+        do { return try source.readExact(at: offset, count: n) }
+        catch {
+            if attempt == 3 { return Data() }
+            Thread.sleep(forTimeInterval: delay)
+            delay = min(delay * 2, 2)
+        }
+    }
+    return Data()
 }
 
 func parseMatroska(_ source: MediaByteSource, webm: Bool) -> Result<MkvResult, CinecoreError> {
@@ -142,7 +157,7 @@ func parseMatroska(_ source: MediaByteSource, webm: Bool) -> Result<MkvResult, C
     let ebmlEnd = ebmlPayload + ebmlSize
     var docType = "matroska"
     if ebmlSize > 0 && ebmlSize < 1_000_000 {
-        let ebml = source.readOrEmpty(at: ebmlPayload, count: Int(ebmlSize))
+        let ebml = exactBytes(source, ebmlPayload, Int(ebmlSize))
         for el in elements(ebml, 0, ebml.count) where el.id == 0x4282 {
             docType = textOf(ebml.subdata(in: el.start ..< el.end))
         }
@@ -167,7 +182,7 @@ func parseMatroska(_ source: MediaByteSource, webm: Bool) -> Result<MkvResult, C
         if h.size == nil { break }
         let payload = Int64(h.size ?? 0)
         if h.id == MID.info && payload > 0 && payload < 1_000_000 {
-            let buf = source.readOrEmpty(at: dataStart, count: Int(payload))
+            let buf = exactBytes(source, dataStart, Int(payload))
             for el in elements(buf, 0, buf.count) {
                 let raw = buf.subdata(in: el.start ..< el.end)
                 if el.id == MID.timestampScale { scale = uintOf(raw) == 0 ? scale : uintOf(raw) }
@@ -175,7 +190,7 @@ func parseMatroska(_ source: MediaByteSource, webm: Bool) -> Result<MkvResult, C
                 if el.id == MID.title { title = textOf(raw) }
             }
         } else if h.id == MID.tracks && payload > 0 && payload < 8_000_000 {
-            let buf = source.readOrEmpty(at: dataStart, count: Int(payload))
+            let buf = exactBytes(source, dataStart, Int(payload))
             for el in elements(buf, 0, buf.count) where el.id == MID.track {
                 if let built = buildMkTrack(buf, el) { drafts.append(built) }
             }
@@ -202,10 +217,9 @@ func parseMatroska(_ source: MediaByteSource, webm: Bool) -> Result<MkvResult, C
             continue
         }
         let payloadStart = clusterAt + headerLen
-        if payload > 0 && payload < 512_000_000 && payloadStart < fileLength {
-            let n = Int(min(payload, fileLength - payloadStart))
-            let blob = source.readOrEmpty(at: payloadStart, count: n)
-            let frames = parseCluster(blob, Int(payloadStart), scale, drafts)
+        let payloadEnd = payloadStart + payload
+        if payload > 0 && payload < 512_000_000 && payloadStart < fileLength && payloadEnd <= fileLength {
+            let frames = indexCluster(source, payloadStart, payloadEnd, scale, drafts)
             for frame in frames {
                 samplesByTrack[frame.track, default: []].append(SampleRec(
                     pts: frame.pts, duration: frame.duration, key: frame.key, offset: frame.offset, size: frame.size, inline: nil
@@ -213,7 +227,7 @@ func parseMatroska(_ source: MediaByteSource, webm: Bool) -> Result<MkvResult, C
             }
         }
         clusters += 1
-        clusterAt = payloadStart + payload
+        clusterAt = payloadEnd
     }
     if clusters == 0 { warnings.append("No cluster found. There is nothing to decode.") }
     var tracks: [LoadedTrack] = []
@@ -340,20 +354,152 @@ private func kindAudio(_ codecId: String, _ channels: Int?, _ sampleRate: Int?) 
 
 private struct FrameRef { var track: Int; var pts: Double; var duration: Double; var key: Bool; var offset: Int; var size: Int }
 
-private func parseCluster(_ payload: Data, _ fileOffset: Int, _ scale: Int, _ drafts: [MkDraft]) -> [FrameRef] {
+/// Cluster index. Element headers, timestamps, and block headers are read.
+/// Frame bytes are skipped. Their file offset and size are what playback reads later.
+private func indexCluster(_ source: MediaByteSource, _ start: Int64, _ end: Int64, _ scale: Int, _ drafts: [MkDraft]) -> [FrameRef] {
     var clusterTs = 0
     var frames: [FrameRef] = []
-    for el in elements(payload, 0, payload.count) {
-        if el.id == MID.timestamp { clusterTs = uintOf(payload.subdata(in: el.start ..< el.end)) }
-        if el.id == MID.simpleBlock { pushBlock(payload, el.start, el.end, fileOffset, clusterTs, scale, true, true, &frames, 0) }
-        if el.id == MID.blockGroup {
-            if let block = child(payload, el, MID.block) {
-                let ref = child(payload, el, MID.reference)
-                let dur = child(payload, el, MID.blockDuration).map { uintOf(payload.subdata(in: $0.start ..< $0.end)) } ?? 0
-                pushBlock(payload, block.start, block.end, fileOffset, clusterTs, scale, false, ref == nil, &frames, dur)
-            }
+    var o = start
+    while o + 2 < end {
+        guard let h = peekId(source, o), let size = h.size else { break }
+        let header = Int64(h.idLen + h.sizeLen)
+        let dataStart = o + header
+        let dataEnd = dataStart + Int64(size)
+        if dataEnd <= dataStart || dataEnd > end { break }
+        if h.id == MID.timestamp {
+            clusterTs = uintOf(exactBytes(source, dataStart, min(size, 8)))
+        } else if h.id == MID.simpleBlock {
+            frames.append(contentsOf: indexBlock(source, dataStart, dataEnd, clusterTs, scale, true, true, 0))
+        } else if h.id == MID.blockGroup {
+            frames.append(contentsOf: indexGroup(source, dataStart, dataEnd, clusterTs, scale))
+        }
+        o = dataEnd
+    }
+    fillFrameDurations(&frames, drafts)
+    return frames
+}
+
+private func indexGroup(_ source: MediaByteSource, _ start: Int64, _ end: Int64, _ clusterTs: Int, _ scale: Int) -> [FrameRef] {
+    var blockAt: (Int64, Int64)?
+    var duration = 0
+    var referenced = false
+    var o = start
+    while o + 2 < end {
+        guard let h = peekId(source, o), let size = h.size else { break }
+        let header = Int64(h.idLen + h.sizeLen)
+        let dataStart = o + header
+        let dataEnd = dataStart + Int64(size)
+        if dataEnd <= dataStart || dataEnd > end { break }
+        if h.id == MID.block { blockAt = (dataStart, dataEnd) }
+        if h.id == MID.blockDuration { duration = uintOf(exactBytes(source, dataStart, min(size, 8))) }
+        if h.id == MID.reference { referenced = true }
+        o = dataEnd
+    }
+    guard let blockAt else { return [] }
+    return indexBlock(source, blockAt.0, blockAt.1, clusterTs, scale, false, !referenced, duration)
+}
+
+private func indexBlock(_ source: MediaByteSource, _ start: Int64, _ end: Int64, _ clusterTs: Int, _ scale: Int, _ simple: Bool, _ keyHint: Bool, _ blockDur: Int) -> [FrameRef] {
+    let length = end - start
+    if length < 4 { return [] }
+    let prefix = exactBytes(source, start, Int(min(length, 16)))
+    guard let vint = readValueVint(prefix, 0) else { return [] }
+    var p = vint.len
+    if p + 3 > prefix.count { return [] }
+    let rel = (Int(prefix[p]) << 8) | Int(prefix[p + 1])
+    let signed = rel & 0x8000 != 0 ? rel - 0x10000 : rel
+    p += 2
+    let flags = Int(prefix[p])
+    p += 1
+    let key = simple ? (flags & 0x80) != 0 : keyHint
+    let lacing = (flags & 0x06) >> 1
+    let spans = laceSpans(source, start + Int64(p), end, lacing)
+    let pts0 = (Double(clusterTs + signed) * Double(scale)) / 1e9
+    let each = !spans.isEmpty && blockDur > 0 ? (Double(blockDur) * Double(scale)) / 1e9 / Double(spans.count) : 0
+    var out: [FrameRef] = []
+    for (i, span) in spans.enumerated() {
+        let size = span.1 - span.0
+        if size <= 0 || span.0 > Int64(Int.max) { continue }
+        out.append(FrameRef(track: vint.value, pts: pts0 + Double(i) * each, duration: each, key: i == 0 ? key : false, offset: Int(span.0), size: Int(size)))
+    }
+    return out
+}
+
+/// Lace headers only. `start` is the first byte after the block flags. `end` is the end of the block.
+private func laceSpans(_ source: MediaByteSource, _ start: Int64, _ end: Int64, _ mode: Int) -> [(Int64, Int64)] {
+    if mode == 0 { return start < end ? [(start, end)] : [] }
+    if start >= end { return [] }
+    if mode == 2 {
+        let countByte = exactBytes(source, start, 1)
+        if countByte.isEmpty { return [] }
+        let count = Int(countByte[0]) + 1
+        if count <= 0 { return [] }
+        let frame = start + 1
+        let total = end - frame
+        if total <= 0 { return [] }
+        let sz = total / Int64(count)
+        return (0 ..< count).map { i in
+            let a = frame + Int64(i) * sz
+            let b = i == count - 1 ? end : frame + Int64(i + 1) * sz
+            return (a, b)
         }
     }
+    let countByte = exactBytes(source, start, 1)
+    if countByte.isEmpty { return [] }
+    let count = Int(countByte[0]) + 1
+    var pos = start + 1
+    if mode == 1 {
+        var sizes: [Int64] = []
+        for _ in 0 ..< (count - 1) {
+            var s: Int64 = 0
+            while pos < end {
+                let b = exactBytes(source, pos, 1)
+                if b.isEmpty { return [] }
+                pos += 1
+                s += Int64(b[0])
+                if b[0] < 255 { break }
+            }
+            sizes.append(s)
+        }
+        var frames: [(Int64, Int64)] = []
+        for s in sizes {
+            let next = min(end, pos + s)
+            if next > pos { frames.append((pos, next)) }
+            pos += s
+        }
+        if pos < end { frames.append((pos, end)) }
+        return frames
+    }
+    guard let first = readExactVint(source, pos, end) else { return pos < end ? [(pos, end)] : [] }
+    pos += Int64(first.len)
+    var sizes = [Int64(first.value)]
+    for i in 1 ..< count {
+        guard let v = readExactVint(source, pos, end) else { break }
+        pos += Int64(v.len)
+        let bias = (1 << (7 * v.len - 1)) - 1
+        sizes.append(sizes[i - 1] + Int64(v.value - bias))
+    }
+    var frames: [(Int64, Int64)] = []
+    for s in sizes {
+        let next = min(end, pos + s)
+        if next > pos { frames.append((pos, next)) }
+        pos += s
+    }
+    if pos < end { frames.append((pos, end)) }
+    return frames
+}
+
+private func readExactVint(_ source: MediaByteSource, _ offset: Int64, _ limit: Int64) -> (value: Int, len: Int)? {
+    if offset >= limit { return nil }
+    let first = exactBytes(source, offset, 1)
+    if first.isEmpty { return nil }
+    let len = vintLen(Int(first[0]))
+    if offset + Int64(len) > limit { return nil }
+    let raw = len == 1 ? first : exactBytes(source, offset, len)
+    return readValueVint(raw, 0)
+}
+
+private func fillFrameDurations(_ frames: inout [FrameRef], _ drafts: [MkDraft]) {
     var byTrack: [Int: [Int]] = [:]
     for (i, f) in frames.enumerated() { byTrack[f.track, default: []].append(i) }
     for (track, indexes) in byTrack {
@@ -369,26 +515,6 @@ private func parseCluster(_ payload: Data, _ fileOffset: Int, _ scale: Int, _ dr
             }
         }
     }
-    return frames
-}
-
-private func pushBlock(_ payload: Data, _ start: Int, _ end: Int, _ fileOffset: Int, _ clusterTs: Int, _ scale: Int, _ simple: Bool, _ keyHint: Bool, _ out: inout [FrameRef], _ blockDur: Int) {
-    guard let vint = readValueVint(payload, start) else { return }
-    var p = start + vint.len
-    if p + 3 > end { return }
-    let rel = (Int(payload[p]) << 8) | Int(payload[p + 1])
-    let signed = rel & 0x8000 != 0 ? rel - 0x10000 : rel
-    p += 2
-    let flags = Int(payload[p])
-    p += 1
-    let key = simple ? (flags & 0x80) != 0 : keyHint
-    let lacing = (flags & 0x06) >> 1
-    let slices = lace(payload, p, end, lacing)
-    let pts0 = (Double(clusterTs + signed) * Double(scale)) / 1e9
-    let each = !slices.isEmpty && blockDur > 0 ? (Double(blockDur) * Double(scale)) / 1e9 / Double(slices.count) : 0
-    for (i, slice) in slices.enumerated() {
-        out.append(FrameRef(track: vint.value, pts: pts0 + Double(i) * each, duration: each, key: i == 0 ? key : false, offset: fileOffset + slice.0, size: max(0, slice.1 - slice.0)))
-    }
 }
 
 private func readValueVint(_ data: Data, _ offset: Int) -> (value: Int, len: Int)? {
@@ -399,51 +525,4 @@ private func readValueVint(_ data: Data, _ offset: Int) -> (value: Int, len: Int
     var value = Int(data[offset]) & (marker - 1)
     if len > 1 { for i in 1 ..< len { value = value * 256 + Int(data[offset + i]) } }
     return (value, len)
-}
-
-private func lace(_ payload: Data, _ start: Int, _ end: Int, _ mode: Int) -> [(Int, Int)] {
-    if mode == 0 { return start < end ? [(start, end)] : [] }
-    if start >= end { return [] }
-    let count = Int(payload[start]) + 1
-    var p = start + 1
-    if mode == 2 {
-        let total = end - p
-        let sz = total / count
-        return (0 ..< count).map { i in (p + i * sz, i == count - 1 ? end : p + (i + 1) * sz) }
-    }
-    if mode == 1 {
-        var sizes: [Int] = []
-        for _ in 0 ..< (count - 1) {
-            var s = 0
-            while p < end {
-                let b = Int(payload[p]); p += 1
-                s += b
-                if b < 255 { break }
-            }
-            sizes.append(s)
-        }
-        var frames: [(Int, Int)] = []
-        for s in sizes {
-            frames.append((p, min(end, p + s)))
-            p += s
-        }
-        frames.append((p, end))
-        return frames.filter { $0.1 > $0.0 }
-    }
-    guard let first = readValueVint(payload, p) else { return [(p, end)] }
-    p += first.len
-    var sizes = [first.value]
-    for i in 1 ..< count {
-        guard let v = readValueVint(payload, p) else { break }
-        p += v.len
-        let bias = (1 << (7 * v.len - 1)) - 1
-        sizes.append(sizes[i - 1] + (v.value - bias))
-    }
-    var frames: [(Int, Int)] = []
-    for s in sizes {
-        frames.append((p, min(end, p + s)))
-        p += s
-    }
-    if p < end { frames.append((p, end)) }
-    return frames.filter { $0.1 > $0.0 }
 }

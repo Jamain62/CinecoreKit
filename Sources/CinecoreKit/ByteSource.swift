@@ -9,6 +9,15 @@ import FoundationNetworking
 public protocol MediaByteSource: AnyObject, Sendable {
     var length: Int64 { get }
     func read(at offset: Int64, count: Int) throws -> Data
+    /// The exact range. Playback may widen a read into a cache block.
+    /// Indexing must use this so a header does not pull the frame behind it.
+    func readExact(at offset: Int64, count: Int) throws -> Data
+}
+
+extension MediaByteSource {
+    public func readExact(at offset: Int64, count: Int) throws -> Data {
+        try read(at: offset, count: count)
+    }
 }
 
 extension MediaByteSource {
@@ -21,7 +30,7 @@ extension MediaByteSource {
         var delay = 0.2
         for attempt in 0 ..< 4 {
             do {
-                return try read(at: offset, count: n)
+                return try readExact(at: offset, count: n)
             } catch {
                 if attempt == 3 { return Data() }
                 Thread.sleep(forTimeInterval: delay)
@@ -102,6 +111,14 @@ public final class HTTPByteSource: MediaByteSource, @unchecked Sendable {
 
     deinit { session.invalidateAndCancel() }
 
+    /// Bypasses the 256 KB cache. Indexing uses this so a block header does not download the frame.
+    public func readExact(at offset: Int64, count: Int) throws -> Data {
+        guard offset >= 0, count > 0 else { return Data() }
+        if offset >= length { return Data() }
+        let n = Int(min(Int64(count), length - offset))
+        return try fetch(offset, n)
+    }
+
     public func read(at offset: Int64, count: Int) throws -> Data {
         guard offset >= 0, count > 0 else { return Data() }
         if offset >= length { return Data() }
@@ -180,9 +197,12 @@ public final class HTTPByteSource: MediaByteSource, @unchecked Sendable {
     }
 
     private static func probeLength(url: URL, session: URLSession, bridge: HTTPBridge, timeout: TimeInterval) throws -> Int64 {
+        if let n = try headLength(url: url, session: session, bridge: bridge, timeout: timeout), n > 0 {
+            return n
+        }
         var request = URLRequest(url: url, timeoutInterval: timeout)
-        request.httpMethod = "HEAD"
-        let transfer = Transfer(expect: nil, allow: [200])
+        request.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+        let transfer = Transfer(expect: 1, allow: [206])
         let task = session.dataTask(with: request)
         bridge.track(task.taskIdentifier, transfer)
         task.resume()
@@ -192,9 +212,25 @@ public final class HTTPByteSource: MediaByteSource, @unchecked Sendable {
         }
         bridge.forget(task.taskIdentifier)
         let snap = transfer.snapshot()
+        if snap.length > 1 { return snap.length }
         if let failure = snap.failure { throw failure }
-        if snap.length > 0 { return snap.length }
-        throw CinecoreError("The server did not say how long \(url.lastPathComponent) is.")
+        throw CinecoreError("The server did not say how long \(url.lastPathComponent) is. HEAD had no length and Range bytes=0-0 had no Content-Range total.")
+    }
+
+    private static func headLength(url: URL, session: URLSession, bridge: HTTPBridge, timeout: TimeInterval) throws -> Int64? {
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "HEAD"
+        let transfer = Transfer(expect: nil, allow: [200])
+        let task = session.dataTask(with: request)
+        bridge.track(task.taskIdentifier, transfer)
+        task.resume()
+        if transfer.sem.wait(timeout: .now() + timeout) == .timedOut {
+            task.cancel()
+            return nil
+        }
+        bridge.forget(task.taskIdentifier)
+        let snap = transfer.snapshot()
+        return snap.length > 0 ? snap.length : nil
     }
 }
 
@@ -262,7 +298,11 @@ private final class Transfer: @unchecked Sendable {
     func noteResponse(_ response: HTTPURLResponse) -> URLSession.ResponseDisposition {
         lock.lock()
         statusCode = response.statusCode
-        if let raw = response.value(forHTTPHeaderField: "Content-Length"), let n = Int64(raw), n >= 0 {
+        if let raw = response.value(forHTTPHeaderField: "Content-Range"),
+           let slash = raw.lastIndex(of: "/"),
+           let n = Int64(raw[raw.index(after: slash)...]), n > 0 {
+            headerLength = n
+        } else if let raw = response.value(forHTTPHeaderField: "Content-Length"), let n = Int64(raw), n >= 0 {
             headerLength = n
         }
         let ok = allow.contains(response.statusCode)
