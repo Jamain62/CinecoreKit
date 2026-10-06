@@ -13,6 +13,10 @@ let package = Package(
     ],
     targets: [
         .target(name: "CinecoreKit"),
-        .testTarget(name: "CinecoreKitTests", dependencies: ["CinecoreKit"]),
+        .testTarget(
+            name: "CinecoreKitTests",
+            dependencies: ["CinecoreKit"],
+            resources: [.copy("Media")]
+        ),
     ]
 )

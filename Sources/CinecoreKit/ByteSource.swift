@@ -12,10 +12,23 @@ public protocol MediaByteSource: AnyObject {
 }
 
 extension MediaByteSource {
+    /// Structural reads. A hard failure is retried, then reported as an empty
+    /// slice so a box walk can stop. Playback must not use this: an empty slice
+    /// is indistinguishable from a dropped frame.
     func readOrEmpty(at offset: Int64, count: Int) -> Data {
         guard offset >= 0, count > 0, offset < length else { return Data() }
         let n = Int(min(Int64(count), length - offset))
-        return (try? read(at: offset, count: n)) ?? Data()
+        var delay = 0.2
+        for attempt in 0 ..< 4 {
+            do {
+                return try read(at: offset, count: n)
+            } catch {
+                if attempt == 3 { return Data() }
+                Thread.sleep(forTimeInterval: delay)
+                delay = min(delay * 2, 2)
+            }
+        }
+        return Data()
     }
 }
 
@@ -131,39 +144,76 @@ public final class HTTPByteSource: MediaByteSource {
         if task.status != 206 {
             throw CinecoreError("Server did not honor the byte range (HTTP \(task.status)). A 60 GB remux cannot be pulled in one response.")
         }
-        if let failure = task.failure { throw failure }
-        return task.data
+        if let failure = task.error { throw failure }
+        return task.body
     }
 
     private static func probeLength(url: URL, session: URLSession, timeout: TimeInterval) throws -> Int64 {
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = "HEAD"
         let sem = DispatchSemaphore(value: 0)
-        var length: Int64 = -1
-        var failure: Error?
+        let probe = ProbeBox()
         session.dataTask(with: request) { _, response, error in
-            if let http = response as? HTTPURLResponse {
-                if let raw = http.value(forHTTPHeaderField: "Content-Length"), let n = Int64(raw), n > 0 {
-                    length = n
-                }
-            }
-            failure = error
+            probe.finish(response, error)
             sem.signal()
         }.resume()
         if sem.wait(timeout: .now() + timeout) == .timedOut {
             throw CinecoreError("Timed out asking for the length of \(url.absoluteString).")
         }
+        let (length, failure) = probe.result()
         if length > 0 { return length }
         if let failure { throw failure }
         throw CinecoreError("The server did not say how long \(url.lastPathComponent) is.")
     }
 }
 
-private final class RangeTask: NSObject, URLSessionDataDelegate {
+private final class ProbeBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var length: Int64 = -1
+    private var failure: Error?
+
+    func finish(_ response: URLResponse?, _ error: Error?) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let http = response as? HTTPURLResponse,
+           let raw = http.value(forHTTPHeaderField: "Content-Length"),
+           let n = Int64(raw), n > 0 {
+            length = n
+        }
+        failure = error
+    }
+
+    func result() -> (Int64, Error?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (length, failure)
+    }
+}
+
+private final class RangeTask: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     let sem = DispatchSemaphore(value: 0)
-    var data = Data()
-    var status = 0
-    var failure: Error?
+    private let lock = NSLock()
+    private var storage = Data()
+    private var statusCode = 0
+    private var failure: Error?
+
+    var status: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return statusCode
+    }
+
+    var body: Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    var error: Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        return failure
+    }
 
     func urlSession(
         _ session: URLSession,
@@ -171,18 +221,27 @@ private final class RangeTask: NSObject, URLSessionDataDelegate {
         didReceive response: URLResponse,
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
-        status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        completionHandler(status == 206 ? .allow : .cancel)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        lock.lock()
+        statusCode = code
+        lock.unlock()
+        completionHandler(code == 206 ? .allow : .cancel)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        self.data.append(data)
+        lock.lock()
+        storage.append(data)
+        lock.unlock()
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if let error {
             let ns = error as NSError
-            if ns.code != NSURLErrorCancelled { failure = error }
+            if ns.code != NSURLErrorCancelled {
+                lock.lock()
+                failure = error
+                lock.unlock()
+            }
         }
         sem.signal()
     }

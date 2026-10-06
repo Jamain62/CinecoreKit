@@ -21,6 +21,7 @@ public final class CinecorePlayer: NSObject, ObservableObject {
     @Published public private(set) var playing = false
     @Published public private(set) var decodePath = "not open"
     @Published public private(set) var detail = "Standby"
+    @Published public private(set) var buffering = false
     @Published public private(set) var lastError: String?
 
     public let view: CinecorePlayerView
@@ -37,6 +38,10 @@ public final class CinecorePlayer: NSObject, ObservableObject {
     private var feedGeneration = 0
     private var videoCursor = 0
     private var audioCursor = 0
+    private var bufferHolds = 0
+    private var videoDelay = 0.4
+    private var audioDelay = 0.4
+    private var readyDetail = "Standby"
     private let mediaQueue = DispatchQueue(label: "cinecore.samples")
     private let cursorLock = NSLock()
     private var ticker: Timer?
@@ -106,20 +111,24 @@ public final class CinecorePlayer: NSObject, ObservableObject {
                 lastError = detail
             } else {
                 decodePath = "VideoToolbox"
-                detail = video.report.codecLabel
+                readyDetail = video.report.codecLabel
+                detail = readyDetail
                 if video.report.hdr.dolbyVision != nil {
                     detail += " · base layer. RPU is attached for the display, not composited here."
+                    readyDetail = detail
                 }
             }
         case .jpeg:
             decodePath = "ImageIO"
-            detail = "Motion JPEG"
-            if let first = video.samples.first {
-                view.show(jpeg: sampleBytes(opened, first))
+            readyDetail = "Motion JPEG"
+            detail = readyDetail
+            if let first = video.samples.first, let bytes = try? loadSample(opened, first) {
+                view.show(jpeg: bytes)
             }
         default:
             decodePath = "metadata"
-            detail = "\(video.report.codecLabel) was demuxed. This engine does not include a \(setup.family.rawValue) decoder."
+            readyDetail = "\(video.report.codecLabel) was demuxed. This engine does not include a \(setup.family.rawValue) decoder."
+            detail = readyDetail
             lastError = detail
         }
         if let audio = opened.audio, audio.playableAudio, let setup = audio.audio, setup.codecs.first?.hasPrefix("mp4a") == true {
@@ -195,17 +204,11 @@ public final class CinecorePlayer: NSObject, ObservableObject {
         cursorLock.lock()
         feedGeneration += 1
         let generation = feedGeneration
-        videoCursor = 0
-        for (index, sample) in track.samples.enumerated() where sample.key && sample.pts <= start + 0.0008 {
-            videoCursor = index
-        }
-        audioCursor = 0
-        if let audio = media.audio {
-            for (index, sample) in audio.samples.enumerated() where sample.pts + sample.duration >= start {
-                audioCursor = index
-                break
-            }
-        }
+        videoCursor = FeedPoint.video(track.samples, from: start)
+        audioCursor = FeedPoint.audio(media.audio?.samples ?? [], from: start)
+        bufferHolds = 0
+        videoDelay = 0.4
+        audioDelay = 0.4
         cursorLock.unlock()
         feeding = true
         display.requestMediaDataWhenReady(on: mediaQueue) { [weak self] in
@@ -223,8 +226,14 @@ public final class CinecorePlayer: NSObject, ObservableObject {
         audioRenderer.stopRequestingMediaData()
         cursorLock.lock()
         feedGeneration += 1
+        bufferHolds = 0
+        videoDelay = 0.4
+        audioDelay = 0.4
         cursorLock.unlock()
         feeding = false
+        DispatchQueue.main.async { [weak self] in
+            self?.buffering = false
+        }
     }
 
     private func supplyVideo(_ generation: Int) {
@@ -250,11 +259,30 @@ public final class CinecorePlayer: NSObject, ObservableObject {
                 return
             }
             let sample = track.samples[videoCursor]
-            videoCursor += 1
+            let cursor = videoCursor
+            let total = track.samples.count
             cursorLock.unlock()
-            let bytes = normalize(sampleBytes(media, sample))
-            guard !bytes.isEmpty, let buffer = makeVideoBuffer(bytes, sample, format) else { continue }
-            display.enqueue(buffer)
+            switch SamplePull.take(cursor: cursor, count: total, read: { try self.loadSample(media, sample) }) {
+            case .finished:
+                display.stopRequestingMediaData()
+                return
+            case .retry:
+                holdForBuffer(generation, video: true)
+                return
+            case .enqueued(let next, let bytes):
+                cursorLock.lock()
+                if generation != feedGeneration {
+                    cursorLock.unlock()
+                    return
+                }
+                videoCursor = next
+                videoDelay = 0.4
+                cursorLock.unlock()
+                noteFlowing()
+                let normalized = normalize(bytes)
+                guard !normalized.isEmpty, let buffer = makeVideoBuffer(normalized, sample, format) else { continue }
+                display.enqueue(buffer)
+            }
         }
     }
 
@@ -280,21 +308,89 @@ public final class CinecorePlayer: NSObject, ObservableObject {
                 return
             }
             let sample = track.samples[audioCursor]
-            audioCursor += 1
+            let cursor = audioCursor
+            let total = track.samples.count
             cursorLock.unlock()
-            let bytes = sampleBytes(media, sample)
-            guard !bytes.isEmpty, let buffer = makeAudioBuffer(bytes, sample, format) else { continue }
-            audioRenderer.enqueue(buffer)
+            switch SamplePull.take(cursor: cursor, count: total, read: { try self.loadSample(media, sample) }) {
+            case .finished:
+                audioRenderer.stopRequestingMediaData()
+                return
+            case .retry:
+                holdForBuffer(generation, video: false)
+                return
+            case .enqueued(let next, let bytes):
+                cursorLock.lock()
+                if generation != feedGeneration {
+                    cursorLock.unlock()
+                    return
+                }
+                audioCursor = next
+                audioDelay = 0.4
+                cursorLock.unlock()
+                noteFlowing()
+                guard !bytes.isEmpty, let buffer = makeAudioBuffer(bytes, sample, format) else { continue }
+                audioRenderer.enqueue(buffer)
+            }
         }
     }
 
-    private func sampleBytes(_ media: LoadedMedia, _ sample: SampleRec) -> Data {
+    /// Failed read. The cursor stays put. The clock stops until a later read works.
+    private func holdForBuffer(_ generation: Int, video: Bool) {
+        cursorLock.lock()
+        bufferHolds += 1
+        let delay = video ? videoDelay : audioDelay
+        if video { videoDelay = min(videoDelay * 2, 5) } else { audioDelay = min(audioDelay * 2, 5) }
+        cursorLock.unlock()
+        if video { display.stopRequestingMediaData() } else { audioRenderer.stopRequestingMediaData() }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.buffering = true
+            self.detail = "Buffering"
+            self.sync.rate = 0
+        }
+        mediaQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.cursorLock.lock()
+            let live = generation == self.feedGeneration
+            if live { self.bufferHolds = max(0, self.bufferHolds - 1) }
+            let waiting = self.bufferHolds > 0
+            self.cursorLock.unlock()
+            guard live else { return }
+            DispatchQueue.main.async {
+                if !waiting {
+                    self.buffering = false
+                    self.detail = self.readyDetail
+                    if self.playing { self.sync.rate = 1 }
+                }
+            }
+            if video {
+                self.display.requestMediaDataWhenReady(on: self.mediaQueue) { [weak self] in
+                    self?.supplyVideo(generation)
+                }
+            } else {
+                self.audioRenderer.requestMediaDataWhenReady(on: self.mediaQueue) { [weak self] in
+                    self?.supplyAudio(generation)
+                }
+            }
+        }
+    }
+
+    private func noteFlowing() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.bufferHolds == 0, self.buffering else { return }
+            self.buffering = false
+            self.detail = self.readyDetail
+        }
+    }
+
+    private func loadSample(_ media: LoadedMedia, _ sample: SampleRec) throws -> Data {
         if let inline = sample.inline { return inline }
         if sample.offset < 0 || sample.size <= 0 { return Data() }
+        let raw = try media.source.read(at: Int64(sample.offset), count: sample.size)
         if media.info.container == "ts", let packet = media.packetSize, let skip = media.headerSkip {
-            return extractPes(media.source, sample.offset, sample.size, packet, skip)
+            return extractPesBytes(raw, packet, skip)
         }
-        return media.source.readOrEmpty(at: Int64(sample.offset), count: sample.size)
+        return raw
     }
 
     private func normalize(_ data: Data) -> Data {
@@ -441,8 +537,9 @@ public final class CinecorePlayer: NSObject, ObservableObject {
         guard let media, let track = media.video else { return }
         time += 0.1
         if time >= duration { pause(); return }
-        if let sample = track.samples.last(where: { $0.pts <= time }) ?? track.samples.first {
-            view.show(jpeg: sampleBytes(media, sample))
+        if let sample = track.samples.last(where: { $0.pts <= time }) ?? track.samples.first,
+           let bytes = try? loadSample(media, sample) {
+            view.show(jpeg: bytes)
         }
     }
 

@@ -280,7 +280,7 @@ func extractPes(_ source: MediaByteSource, _ offset: Int, _ size: Int, _ packetS
     return extractPesBytes(raw, packetSize, headerSkip)
 }
 
-private func extractPesBytes(_ raw: Data, _ packetSize: Int, _ headerSkip: Int) -> Data {
+func extractPesBytes(_ raw: Data, _ packetSize: Int, _ headerSkip: Int) -> Data {
     var parts: [Data] = []
     var first = true
     var o = 0

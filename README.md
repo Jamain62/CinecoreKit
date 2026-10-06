@@ -28,8 +28,10 @@ An MP4 index reads the movie header and skips `mdat`. A Matroska index reads
 one cluster at a time and keeps only the sample table. The table is in
 memory. The picture bytes are not, until a sample is enqueued.
 
-The player still has no subtitle renderer, no audio-track picker, and no
-stall recovery beyond a failed range read. Those are not done.
+A failed sample read does not advance the cursor. The clock pauses, `buffering`
+becomes true, and the same sample is tried again with a longer wait, up to
+five seconds. A seek past the last audio sample stays past the end instead of
+restarting that track at zero.
 
 VP9, AV1, Opus, AC-3, E-AC-3, TrueHD, and DTS are identified. They are not
 decoded. Saying otherwise would be a lie: Apple does not ship those decoders
