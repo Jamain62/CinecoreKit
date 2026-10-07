@@ -127,6 +127,8 @@ public struct LoadedMedia {
     /// MPEG-TS packet size, when the container is a transport stream.
     public var packetSize: Int?
     public var headerSkip: Int?
+    /// Set for Matroska opened from HTTP. Samples grow as clusters are indexed.
+    public var matroska: MatroskaIndex?
 }
 
 public struct CinecoreError: Error, CustomStringConvertible {

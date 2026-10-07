@@ -114,6 +114,16 @@ private enum MID {
     static let block = 0xa1
     static let blockDuration = 0x9b
     static let reference = 0xfb
+    static let seekHead = 0x114d9b74
+    static let seek = 0x4dbb
+    static let seekID = 0x53ab
+    static let seekPosition = 0x53ac
+    static let cues = 0x1c53bb6b
+    static let cuePoint = 0xbb
+    static let cueTime = 0xb3
+    static let cueTrackPositions = 0xb7
+    static let cueTrack = 0xf7
+    static let cueClusterPosition = 0xf1
 }
 
 struct MkvResult {
@@ -122,6 +132,7 @@ struct MkvResult {
     var tracks: [LoadedTrack]
     var warnings: [String]
     var log: [String]
+    var index: MatroskaIndex?
 }
 
 private func peekId(_ source: MediaByteSource, _ offset: Int64) -> IdSize? {
@@ -173,6 +184,8 @@ func parseMatroska(_ source: MediaByteSource, webm: Bool) -> Result<MkvResult, C
     var duration = 0.0
     var title = ""
     var drafts: [MkDraft] = []
+    var seekMap: [Int: Int64] = [:]
+    var cuePayload: Data?
     var guardN = 0
     while o + 2 < segmentEnd && guardN < 4000 {
         guardN += 1
@@ -194,6 +207,10 @@ func parseMatroska(_ source: MediaByteSource, webm: Bool) -> Result<MkvResult, C
             for el in elements(buf, 0, buf.count) where el.id == MID.track {
                 if let built = buildMkTrack(buf, el) { drafts.append(built) }
             }
+        } else if h.id == MID.seekHead && payload > 0 && payload < 1_000_000 {
+            seekMap = parseSeekHead(exactBytes(source, dataStart, Int(payload)))
+        } else if h.id == MID.cues && payload > 0 && payload < 32_000_000 {
+            cuePayload = exactBytes(source, dataStart, Int(payload))
         } else if h.id == MID.cluster {
             break
         }
@@ -203,33 +220,54 @@ func parseMatroska(_ source: MediaByteSource, webm: Bool) -> Result<MkvResult, C
     }
     if title.isEmpty == false { log.append(title) }
     log.append("\(docType) · timescale \(scale) ns · \(drafts.count) tracks")
+    let remote = source is HTTPByteSource
     var samplesByTrack: [Int: [SampleRec]] = [:]
     for draft in drafts { samplesByTrack[draft.number] = [] }
-    var clusterAt = o
-    var clusters = 0
-    while clusterAt + 2 < segmentEnd && clusters < 200_000 {
-        guard let h = peekId(source, clusterAt) else { break }
-        let headerLen = Int64(h.idLen + h.sizeLen)
-        if h.size == nil { break }
-        let payload = Int64(h.size ?? 0)
-        if h.id != MID.cluster {
-            clusterAt = clusterAt + headerLen + payload
-            continue
+    var timeline: MatroskaIndex?
+    if remote {
+        if cuePayload == nil, let relative = seekMap[MID.cues] {
+            cuePayload = elementPayload(source, segmentData + relative)
         }
-        let payloadStart = clusterAt + headerLen
-        let payloadEnd = payloadStart + payload
-        if payload > 0 && payload < 512_000_000 && payloadStart < fileLength && payloadEnd <= fileLength {
-            let frames = indexCluster(source, payloadStart, payloadEnd, scale, drafts)
-            for frame in frames {
-                samplesByTrack[frame.track, default: []].append(SampleRec(
-                    pts: frame.pts, duration: frame.duration, key: frame.key, offset: frame.offset, size: frame.size, inline: nil
-                ))
+        let cueList = parseCueList(cuePayload ?? Data(), scale, segmentData)
+        let timelineBox = MatroskaIndex(source: source, segmentEnd: segmentEnd, scale: scale, drafts: drafts, cues: cueList)
+        if let head = peekId(source, o), head.id == MID.cluster {
+            timelineBox.ingest(clusterAt: o)
+        }
+        for draft in drafts {
+            samplesByTrack[draft.number] = timelineBox.samples(for: draft.number)
+        }
+        timeline = timelineBox
+        log.append("remote cues \(cueList.count) · indexed \(timelineBox.indexedClusters) cluster")
+        if cueList.isEmpty {
+            warnings.append("No Matroska cues. Playback can start, but a far seek has to walk forward cluster by cluster.")
+        }
+    } else {
+        var clusterAt = o
+        var clusters = 0
+        while clusterAt + 2 < segmentEnd && clusters < 200_000 {
+            guard let h = peekId(source, clusterAt) else { break }
+            let headerLen = Int64(h.idLen + h.sizeLen)
+            if h.size == nil { break }
+            let payload = Int64(h.size ?? 0)
+            if h.id != MID.cluster {
+                clusterAt = clusterAt + headerLen + payload
+                continue
             }
+            let payloadStart = clusterAt + headerLen
+            let payloadEnd = payloadStart + payload
+            if payload > 0 && payload < 512_000_000 && payloadStart < fileLength && payloadEnd <= fileLength {
+                let frames = indexCluster(source, payloadStart, payloadEnd, scale, drafts)
+                for frame in frames {
+                    samplesByTrack[frame.track, default: []].append(SampleRec(
+                        pts: frame.pts, duration: frame.duration, key: frame.key, offset: frame.offset, size: frame.size, inline: nil
+                    ))
+                }
+            }
+            clusters += 1
+            clusterAt = payloadEnd
         }
-        clusters += 1
-        clusterAt = payloadEnd
+        if clusters == 0 { warnings.append("No cluster found. There is nothing to decode.") }
     }
-    if clusters == 0 { warnings.append("No cluster found. There is nothing to decode.") }
     var tracks: [LoadedTrack] = []
     for draft in drafts {
         var samples = samplesByTrack[draft.number] ?? []
@@ -240,7 +278,159 @@ func parseMatroska(_ source: MediaByteSource, webm: Bool) -> Result<MkvResult, C
         tracks.append(LoadedTrack(report: report, samples: samples, video: draft.video, audio: draft.audio, playableAudio: draft.playable, timescale: 1_000_000_000))
     }
     if webm || docType == "webm" { log.append("WebM") }
-    return .success(MkvResult(docType: docType, duration: max(duration, tracks.map(\.report.duration).max() ?? 0), tracks: tracks, warnings: warnings, log: log))
+    let movie = max(duration, tracks.map(\.report.duration).max() ?? 0)
+    return .success(MkvResult(docType: docType, duration: movie, tracks: tracks, warnings: warnings, log: log, index: timeline))
+}
+
+private func parseSeekHead(_ buf: Data) -> [Int: Int64] {
+    var map: [Int: Int64] = [:]
+    for seek in elements(buf, 0, buf.count) where seek.id == MID.seek {
+        var id = 0
+        var position = 0
+        for el in elements(buf, seek.start, seek.end) {
+            let raw = buf.subdata(in: el.start ..< el.end)
+            if el.id == MID.seekID { id = uintOf(raw) }
+            if el.id == MID.seekPosition { position = uintOf(raw) }
+        }
+        if id != 0 { map[id] = Int64(position) }
+    }
+    return map
+}
+
+private func parseCueList(_ buf: Data, _ scale: Int, _ segmentData: Int64) -> [MatroskaCue] {
+    var out: [MatroskaCue] = []
+    for point in elements(buf, 0, buf.count) where point.id == MID.cuePoint {
+        var cueTime = 0
+        var cluster: Int?
+        for el in elements(buf, point.start, point.end) {
+            if el.id == MID.cueTime { cueTime = uintOf(buf.subdata(in: el.start ..< el.end)) }
+            if el.id == MID.cueTrackPositions {
+                for child in elements(buf, el.start, el.end) where child.id == MID.cueClusterPosition {
+                    cluster = uintOf(buf.subdata(in: child.start ..< child.end))
+                }
+            }
+        }
+        if let cluster {
+            out.append(MatroskaCue(time: (Double(cueTime) * Double(scale)) / 1e9, cluster: segmentData + Int64(cluster)))
+        }
+    }
+    return out.sorted { $0.time < $1.time }
+}
+
+private func elementPayload(_ source: MediaByteSource, _ at: Int64) -> Data? {
+    guard let head = peekId(source, at), let size = head.size, size > 0, size < 32_000_000 else { return nil }
+    let start = at + Int64(head.idLen + head.sizeLen)
+    return exactBytes(source, start, size)
+}
+
+public struct MatroskaCue: Equatable {
+    public var time: Double
+    /// Absolute file offset of the Cluster element.
+    public var cluster: Int64
+}
+
+/// Cue-driven Matroska index. Remote opens keep this and fill it as playback moves.
+/// Indexed clusters stay cached. A seek jumps to the cue. It does not walk the clusters in between.
+public final class MatroskaIndex: @unchecked Sendable {
+    public let cueCount: Int
+    public private(set) var indexedClusters = 0
+    public private(set) var finished = false
+    private let source: any MediaByteSource
+    private let segmentEnd: Int64
+    private let scale: Int
+    private let drafts: [MkDraft]
+    private let cues: [MatroskaCue]
+    private let lock = NSLock()
+    private var clusters: [Int64: (end: Int64, frames: [FrameRef])] = [:]
+    private var frontier: Int64 = 0
+
+    fileprivate init(source: any MediaByteSource, segmentEnd: Int64, scale: Int, drafts: [MkDraft], cues: [MatroskaCue]) {
+        self.source = source
+        self.segmentEnd = segmentEnd
+        self.scale = scale
+        self.drafts = drafts
+        self.cues = cues
+        cueCount = cues.count
+    }
+
+    public func samples(for track: Int) -> [SampleRec] {
+        lock.lock()
+        let frames = clusters.values.flatMap(\.frames).filter { $0.track == track }
+        lock.unlock()
+        return frames.sorted { $0.pts < $1.pts }.map {
+            SampleRec(pts: $0.pts, duration: $0.duration, key: $0.key, offset: $0.offset, size: $0.size, inline: nil)
+        }
+    }
+
+    /// Index the cluster a cue says covers `time`. Clusters before that cue are left unread.
+    public func index(covering time: Double) {
+        lock.lock()
+        let cue = cues.last(where: { $0.time <= time + 0.0008 }) ?? cues.first
+        let already = cue.map { clusters[$0.cluster] != nil } ?? false
+        lock.unlock()
+        if already { return }
+        if let cue {
+            ingest(clusterAt: cue.cluster)
+            return
+        }
+        for _ in 0 ..< 8 {
+            if covers(time) { return }
+            if !indexAhead() { return }
+        }
+    }
+
+    /// Index the next cluster after the one most recently opened.
+    @discardableResult
+    public func indexAhead() -> Bool {
+        lock.lock()
+        var cursor = frontier
+        let end = segmentEnd
+        lock.unlock()
+        var steps = 0
+        while cursor + 2 < end && steps < 8 {
+            steps += 1
+            guard let head = peekId(source, cursor), let size = head.size else { break }
+            let header = Int64(head.idLen + head.sizeLen)
+            let next = cursor + header + Int64(size)
+            if next <= cursor { break }
+            if head.id == MID.cluster {
+                return ingest(clusterAt: cursor)
+            }
+            cursor = next
+        }
+        lock.lock()
+        finished = true
+        lock.unlock()
+        return false
+    }
+
+    @discardableResult
+    fileprivate func ingest(clusterAt fileOffset: Int64) -> Bool {
+        lock.lock()
+        let seen = clusters[fileOffset] != nil
+        lock.unlock()
+        if seen { return false }
+        guard let head = peekId(source, fileOffset), head.id == MID.cluster, let size = head.size else { return false }
+        let header = Int64(head.idLen + head.sizeLen)
+        let start = fileOffset + header
+        let end = start + Int64(size)
+        guard end > start, end <= source.length else { return false }
+        let frames = indexCluster(source, start, end, scale, drafts)
+        lock.lock()
+        clusters[fileOffset] = (end, frames)
+        indexedClusters = clusters.count
+        frontier = end
+        finished = end >= segmentEnd
+        lock.unlock()
+        return true
+    }
+
+    private func covers(_ time: Double) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let last = clusters.values.flatMap(\.frames).map(\.pts).max() ?? -1
+        return last + 0.05 >= time
+    }
 }
 
 private struct MkDraft {

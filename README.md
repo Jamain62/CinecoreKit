@@ -30,9 +30,10 @@ hole as a frame. The block cache is 256 KB and is not the file.
 If `HEAD` does not return a length, the length is taken from `Content-Range`
 on `GET Range: bytes=0-0`. An MP4 index reads the movie header and skips
 `mdat`. A Matroska index reads one cluster at a time and keeps only the sample
-table. A cluster index reads block headers, not the frames. The frame is
-fetched when the player asks for that sample. The table is in memory. The
-picture bytes are not, until then.
+table. On a local file every cluster is indexed. On HTTP, open reads the
+SeekHead and Cues, then indexes only the first cluster. Later clusters are
+indexed when playback reaches them or a seek lands on a cue. A seek does not
+walk the clusters in between, and a cluster that was already read stays cached.
 
 A failed sample read does not advance the cursor. The clock pauses, `buffering`
 becomes true, and the same sample is tried again with a longer wait, up to

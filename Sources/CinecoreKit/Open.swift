@@ -34,7 +34,9 @@ public enum CinecoreOpen {
                 info.warnings = mkv.warnings
                 info.log = mkv.log
                 info.tracks = mkv.tracks.map(\.report)
-                return pack(info, source, mkv.tracks, nil, nil)
+                var media = pack(info, source, mkv.tracks, nil, nil)
+                media.matroska = mkv.index
+                return media
             }
         }
         if head.count >= 12 && Bytes.fourcc(head, 0) == "RIFF" && Bytes.fourcc(head, 8) == "AVI " {

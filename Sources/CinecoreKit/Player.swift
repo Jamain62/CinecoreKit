@@ -199,13 +199,24 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
         duration = 0
     }
 
+    private func listedSamples(_ media: LoadedMedia, video: Bool) -> [SampleRec] {
+        if let index = media.matroska {
+            let id = video ? media.video?.report.id : media.audio?.report.id
+            if let id { return index.samples(for: id) }
+        }
+        return (video ? media.video?.samples : media.audio?.samples) ?? []
+    }
+
     private func startFeeding(from start: Double) {
-        guard let media, let track = media.video else { return }
+        guard let media, media.video != nil else { return }
+        media.matroska?.index(covering: start)
+        let videoSamples = listedSamples(media, video: true)
+        let audioSamples = listedSamples(media, video: false)
         cursorLock.lock()
         feedGeneration += 1
         let generation = feedGeneration
-        videoCursor = FeedPoint.video(track.samples, from: start)
-        audioCursor = FeedPoint.audio(media.audio?.samples ?? [], from: start)
+        videoCursor = FeedPoint.video(videoSamples, from: start)
+        audioCursor = FeedPoint.audio(audioSamples, from: start)
         bufferHolds = 0
         videoDelay = 0.4
         audioDelay = 0.4
@@ -248,19 +259,22 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
                 cursorLock.unlock()
                 return
             }
-            guard let media, let track = media.video else {
+            guard let media, media.video != nil else {
                 cursorLock.unlock()
                 display.stopRequestingMediaData()
                 return
             }
-            if videoCursor >= track.samples.count {
+            let samples = listedSamples(media, video: true)
+            if videoCursor >= samples.count {
+                let grow = media.matroska?.indexAhead() ?? false
                 cursorLock.unlock()
+                if grow { continue }
                 display.stopRequestingMediaData()
                 return
             }
-            let sample = track.samples[videoCursor]
+            let sample = samples[videoCursor]
             let cursor = videoCursor
-            let total = track.samples.count
+            let total = samples.count
             cursorLock.unlock()
             switch SamplePull.take(cursor: cursor, count: total, read: { try self.loadSample(media, sample) }) {
             case .finished:
@@ -302,14 +316,17 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
                 audioRenderer.stopRequestingMediaData()
                 return
             }
-            if audioCursor >= track.samples.count {
+            let samples = listedSamples(media, video: false)
+            if audioCursor >= samples.count {
+                let grow = media.matroska?.indexAhead() ?? false
                 cursorLock.unlock()
+                if grow { continue }
                 audioRenderer.stopRequestingMediaData()
                 return
             }
-            let sample = track.samples[audioCursor]
+            let sample = samples[audioCursor]
             let cursor = audioCursor
-            let total = track.samples.count
+            let total = samples.count
             cursorLock.unlock()
             switch SamplePull.take(cursor: cursor, count: total, read: { try self.loadSample(media, sample) }) {
             case .finished:
