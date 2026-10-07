@@ -330,8 +330,14 @@ public struct MatroskaCue: Equatable {
 }
 
 /// Cue-driven Matroska index. Remote opens keep this and fill it as playback moves.
-/// Indexed clusters stay cached. A seek jumps to the cue. It does not walk the clusters in between.
+/// The cache remembers every cluster that has been read. The playback frontier is
+/// separate: a seek, including a seek back onto a cached cluster, starts a new
+/// chain at that cluster. Later cached clusters are not treated as the next frame.
 public final class MatroskaIndex: @unchecked Sendable {
+    /// A cue-less seek stops after this many new clusters even if the time is still ahead.
+    /// One cluster a second is far more than a feature film. The cap is there so a
+    /// missing cue does not turn into an unbounded scan.
+    public static let cueLessWalkLimit = 50_000
     public let cueCount: Int
     public private(set) var indexedClusters = 0
     public private(set) var finished = false
@@ -342,6 +348,9 @@ public final class MatroskaIndex: @unchecked Sendable {
     private let cues: [MatroskaCue]
     private let lock = NSLock()
     private var clusters: [Int64: (end: Int64, frames: [FrameRef])] = [:]
+    /// File offsets of the clusters in the active chain, in playback order.
+    private var playback: [Int64] = []
+    /// First byte after the active chain. The next cluster, if there is one, starts here.
     private var frontier: Int64 = 0
 
     fileprivate init(source: any MediaByteSource, segmentEnd: Int64, scale: Int, drafts: [MkDraft], cues: [MatroskaCue]) {
@@ -353,50 +362,62 @@ public final class MatroskaIndex: @unchecked Sendable {
         cueCount = cues.count
     }
 
+    /// Samples in the active chain only. A cached cluster from another seek is omitted.
     public func samples(for track: Int) -> [SampleRec] {
         lock.lock()
-        let frames = clusters.values.flatMap(\.frames).filter { $0.track == track }
+        let frames = activeFrames().filter { $0.track == track }
         lock.unlock()
-        return frames.sorted { $0.pts < $1.pts }.map {
+        return frames.map {
             SampleRec(pts: $0.pts, duration: $0.duration, key: $0.key, offset: $0.offset, size: $0.size, inline: nil)
         }
     }
 
-    /// Index the cluster a cue says covers `time`. Clusters before that cue are left unread.
+    /// Index the cluster that covers `time` and make it the playback start.
+    /// With cues, clusters before that cue are not read. Without cues, clusters
+    /// are walked until the time is inside the active chain, the segment ends,
+    /// or `cueLessWalkLimit` is hit.
     public func index(covering time: Double) {
-        lock.lock()
-        let cue = cues.last(where: { $0.time <= time + 0.0008 }) ?? cues.first
-        let already = cue.map { clusters[$0.cluster] != nil } ?? false
-        lock.unlock()
-        if already { return }
-        if let cue {
-            ingest(clusterAt: cue.cluster)
+        if !cues.isEmpty {
+            guard let cue = cues.last(where: { $0.time <= time + 0.0008 }) ?? cues.first else { return }
+            if !isCached(cue.cluster) { cache(clusterAt: cue.cluster) }
+            activate(cue.cluster)
             return
         }
-        for _ in 0 ..< 8 {
-            if covers(time) { return }
+        lock.lock()
+        let hit = clusterCovering(time)
+        lock.unlock()
+        if let hit {
+            activate(hit)
+            return
+        }
+        var walked = 0
+        while walked < Self.cueLessWalkLimit {
+            if playbackCovers(time) { return }
             if !indexAhead() { return }
+            walked += 1
         }
     }
 
-    /// Index the next cluster after the one most recently opened.
+    /// Index the next cluster after the active chain. A cluster already in the
+    /// cache is reused and not read again.
     @discardableResult
     public func indexAhead() -> Bool {
         lock.lock()
         var cursor = frontier
-        let end = segmentEnd
+        let endLimit = segmentEnd
         lock.unlock()
-        var steps = 0
-        while cursor + 2 < end && steps < 8 {
-            steps += 1
+        var skips = 0
+        while cursor + 2 < endLimit && skips < 32 {
             guard let head = peekId(source, cursor), let size = head.size else { break }
             let header = Int64(head.idLen + head.sizeLen)
             let next = cursor + header + Int64(size)
             if next <= cursor { break }
             if head.id == MID.cluster {
-                return ingest(clusterAt: cursor)
+                if !isCached(cursor) { cache(clusterAt: cursor) }
+                return extend(cursor)
             }
             cursor = next
+            skips += 1
         }
         lock.lock()
         finished = true
@@ -406,10 +427,20 @@ public final class MatroskaIndex: @unchecked Sendable {
 
     @discardableResult
     fileprivate func ingest(clusterAt fileOffset: Int64) -> Bool {
+        let fresh = cache(clusterAt: fileOffset)
+        activate(fileOffset)
+        return fresh
+    }
+
+    private func isCached(_ fileOffset: Int64) -> Bool {
         lock.lock()
-        let seen = clusters[fileOffset] != nil
-        lock.unlock()
-        if seen { return false }
+        defer { lock.unlock() }
+        return clusters[fileOffset] != nil
+    }
+
+    @discardableResult
+    private func cache(clusterAt fileOffset: Int64) -> Bool {
+        if isCached(fileOffset) { return false }
         guard let head = peekId(source, fileOffset), head.id == MID.cluster, let size = head.size else { return false }
         let header = Int64(head.idLen + head.sizeLen)
         let start = fileOffset + header
@@ -417,19 +448,60 @@ public final class MatroskaIndex: @unchecked Sendable {
         guard end > start, end <= source.length else { return false }
         let frames = indexCluster(source, start, end, scale, drafts)
         lock.lock()
-        clusters[fileOffset] = (end, frames)
-        indexedClusters = clusters.count
-        frontier = end
-        finished = end >= segmentEnd
+        if clusters[fileOffset] == nil {
+            clusters[fileOffset] = (end, frames)
+            indexedClusters = clusters.count
+        }
         lock.unlock()
         return true
     }
 
-    private func covers(_ time: Double) -> Bool {
+    /// The active chain becomes this one cluster. Anything cached after it stays
+    /// cached, but it is not the next sample.
+    private func activate(_ fileOffset: Int64) {
         lock.lock()
         defer { lock.unlock() }
-        let last = clusters.values.flatMap(\.frames).map(\.pts).max() ?? -1
-        return last + 0.05 >= time
+        guard let cluster = clusters[fileOffset] else { return }
+        playback = [fileOffset]
+        frontier = cluster.end
+        finished = frontier >= segmentEnd
+    }
+
+    private func extend(_ fileOffset: Int64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let cluster = clusters[fileOffset] else { return false }
+        if playback.last == fileOffset { return false }
+        playback.append(fileOffset)
+        frontier = cluster.end
+        finished = frontier >= segmentEnd
+        return true
+    }
+
+    private func activeFrames() -> [FrameRef] {
+        var frames: [FrameRef] = []
+        for offset in playback {
+            if let cluster = clusters[offset] { frames.append(contentsOf: cluster.frames) }
+        }
+        return frames
+    }
+
+    private func clusterCovering(_ time: Double) -> Int64? {
+        var best: (offset: Int64, start: Double)?
+        for (offset, cluster) in clusters {
+            guard let start = cluster.frames.map(\.pts).min() else { continue }
+            let end = cluster.frames.map { $0.pts + $0.duration }.max() ?? start
+            guard start <= time + 0.0008, time <= end + 0.0008 else { continue }
+            if best == nil || start >= best!.start { best = (offset, start) }
+        }
+        return best?.offset
+    }
+
+    private func playbackCovers(_ time: Double) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let last = activeFrames().max(by: { $0.pts < $1.pts }) else { return false }
+        return last.pts + max(last.duration, 0) + 0.001 >= time
     }
 }
 

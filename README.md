@@ -32,8 +32,11 @@ on `GET Range: bytes=0-0`. An MP4 index reads the movie header and skips
 `mdat`. A Matroska index reads one cluster at a time and keeps only the sample
 table. On a local file every cluster is indexed. On HTTP, open reads the
 SeekHead and Cues, then indexes only the first cluster. Later clusters are
-indexed when playback reaches them or a seek lands on a cue. A seek does not
-walk the clusters in between, and a cluster that was already read stays cached.
+indexed when playback reaches them or a seek lands on a cue. The cache and
+the playback chain are separate. Seeking back onto a cluster already in
+memory starts again at that cluster. A cluster cached from a later seek is
+not the next frame. A file with no cues is walked forward until the requested
+time is inside the chain, the file ends, or 50,000 clusters have been examined.
 
 A failed sample read does not advance the cursor. The clock pauses, `buffering`
 becomes true, and the same sample is tried again with a longer wait, up to
