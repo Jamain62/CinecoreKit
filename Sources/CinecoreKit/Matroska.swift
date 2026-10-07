@@ -172,11 +172,12 @@ private func peekNow(_ source: MediaByteSource, _ offset: Int64) throws -> IdSiz
     return readIdSize(try bytesNow(source, offset, 16), 0)
 }
 
-public enum IndexAdvance: Equatable {
+enum IndexAdvance: Equatable {
     case advanced
     case endOfFile
     case malformed
     case retry
+    case cancelled
 }
 
 func parseMatroska(_ source: MediaByteSource, webm: Bool) -> Result<MkvResult, CinecoreError> {
@@ -351,7 +352,7 @@ private func elementPayload(_ source: MediaByteSource, _ at: Int64) -> Data? {
     return exactBytes(source, start, size)
 }
 
-public struct MatroskaCue: Equatable {
+struct MatroskaCue: Equatable {
     public var time: Double
     /// Absolute file offset of the Cluster element.
     public var cluster: Int64
@@ -361,14 +362,18 @@ public struct MatroskaCue: Equatable {
 /// The cache remembers every cluster that has been read. The playback frontier is
 /// separate: a seek, including a seek back onto a cached cluster, starts a new
 /// chain at that cluster. Later cached clusters are not treated as the next frame.
-public final class MatroskaIndex: @unchecked Sendable {
+/// The cluster dictionary and the active sample arrays are only mutated under
+/// `lock`. Reads of sample bytes happen outside the lock, then the result is
+/// stored under the lock. Unchecked is used because the type is a synchronous
+/// index, not an actor, and it is called from the sample queue and from tests.
+final class MatroskaIndex: @unchecked Sendable {
     /// A cue-less seek stops after this many new clusters even if the time is still ahead.
     /// One cluster a second is far more than a feature film. The cap is there so a
     /// missing cue does not turn into an unbounded scan.
-    public static let cueLessWalkLimit = 50_000
-    public let cueCount: Int
-    public private(set) var indexedClusters = 0
-    public private(set) var finished = false
+    static let cueLessWalkLimit = 50_000
+    let cueCount: Int
+    private(set) var indexedClusters = 0
+    private(set) var finished = false
     private let source: any MediaByteSource
     private let segmentEnd: Int64
     private let scale: Int
@@ -382,7 +387,7 @@ public final class MatroskaIndex: @unchecked Sendable {
     private var frontier: Int64 = 0
     /// Flat per-track samples for the active chain. Appended to. Not rebuilt per frame.
     private var activeSamples: [Int: [SampleRec]] = [:]
-    public private(set) var lastIndexError: String?
+    private(set) var lastIndexError: String?
 
     fileprivate init(source: any MediaByteSource, segmentEnd: Int64, scale: Int, drafts: [MkDraft], cues: [MatroskaCue]) {
         self.source = source
@@ -393,26 +398,26 @@ public final class MatroskaIndex: @unchecked Sendable {
         cueCount = cues.count
     }
 
-    public func samples(for track: Int) -> [SampleRec] {
+    func samples(for track: Int) -> [SampleRec] {
         lock.lock()
         defer { lock.unlock() }
         return activeSamples[track] ?? []
     }
 
-    public func sampleCount(for track: Int) -> Int {
+    func sampleCount(for track: Int) -> Int {
         lock.lock()
         defer { lock.unlock() }
         return activeSamples[track]?.count ?? 0
     }
 
-    public func sample(track: Int, at index: Int) -> SampleRec? {
+    func sample(track: Int, at index: Int) -> SampleRec? {
         lock.lock()
         defer { lock.unlock() }
         guard let list = activeSamples[track], index >= 0, index < list.count else { return nil }
         return list[index]
     }
 
-    public func firstIndex(track: Int, from time: Double, keyframe: Bool) -> Int {
+    func firstIndex(track: Int, from time: Double, keyframe: Bool) -> Int {
         lock.lock()
         defer { lock.unlock() }
         guard let list = activeSamples[track], !list.isEmpty else { return 0 }
@@ -430,7 +435,8 @@ public final class MatroskaIndex: @unchecked Sendable {
     }
 
     @discardableResult
-    public func index(covering time: Double) -> IndexAdvance {
+    func index(covering time: Double) -> IndexAdvance {
+        if source.isWorkCancelled { return .cancelled }
         if !cues.isEmpty {
             guard let cue = cues.last(where: { $0.time <= time + 0.0008 }) ?? cues.first else { return .endOfFile }
             if !isCached(cue.cluster) {
@@ -458,7 +464,11 @@ public final class MatroskaIndex: @unchecked Sendable {
     }
 
     @discardableResult
-    public func indexAhead() -> IndexAdvance {
+    func indexAhead() -> IndexAdvance {
+        if source.isWorkCancelled {
+            lastIndexError = "Indexing cancelled."
+            return .cancelled
+        }
         lock.lock()
         var cursor = frontier
         let endLimit = segmentEnd
@@ -539,8 +549,13 @@ public final class MatroskaIndex: @unchecked Sendable {
                 indexedClusters = clusters.count
             }
             lock.unlock()
+            evict(keeping: fileOffset)
             return .advanced
         } catch {
+            if source.isWorkCancelled {
+                lastIndexError = "Indexing cancelled."
+                return .cancelled
+            }
             lastIndexError = String(describing: error)
             return .retry
         }
@@ -568,6 +583,32 @@ public final class MatroskaIndex: @unchecked Sendable {
             activeSamples[track, default: []].append(contentsOf: recs)
         }
         return true
+    }
+
+    /// Cached clusters that are not in the active chain are capped. The chain
+    /// itself is kept, because those samples are what playback is reading.
+    private func evict(keeping extra: Int64) {
+        let limit = 96
+        lock.lock()
+        defer { lock.unlock() }
+        var keep = Set(playback)
+        keep.insert(extra)
+        while clusters.count > limit {
+            guard let victim = clusters.keys.filter({ keep.contains($0) == false }).max(by: {
+                abs($0 - frontier) < abs($1 - frontier)
+            }) else { return }
+            clusters.removeValue(forKey: victim)
+        }
+        indexedClusters = clusters.count
+    }
+
+    func indexedSpan() -> (Double, Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        let samples = activeSamples.values.flatMap { $0 }
+        let start = samples.map(\.pts).min() ?? 0
+        let end = samples.map { $0.pts + $0.duration }.max() ?? start
+        return (start, end)
     }
 
     private func records(_ frames: [FrameRef]) -> [Int: [SampleRec]] {

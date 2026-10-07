@@ -79,10 +79,10 @@ public struct MediaInfo: Equatable {
     public var log: [String]
 }
 
-public enum Bitstream: String, Equatable { case avcc, annexb, raw }
-public enum VideoFamily: String, Equatable { case avc, hevc, av1, vp8, vp9, jpeg, other }
+enum Bitstream: String, Equatable { case avcc, annexb, raw }
+enum VideoFamily: String, Equatable { case avc, hevc, av1, vp8, vp9, jpeg, other }
 
-public struct VideoSetup: Equatable {
+struct VideoSetup: Equatable {
     public var family: VideoFamily
     public var codecs: [String]
     public var description: Data?
@@ -93,14 +93,14 @@ public struct VideoSetup: Equatable {
     public var atoms: [String: Data]
 }
 
-public struct AudioSetup: Equatable {
+struct AudioSetup: Equatable {
     public var codecs: [String]
     public var description: Data?
     public var sampleRate: Int
     public var channels: Int
 }
 
-public struct SampleRec: Equatable {
+struct SampleRec: Equatable {
     public var pts: Double
     public var duration: Double
     public var key: Bool
@@ -109,7 +109,7 @@ public struct SampleRec: Equatable {
     public var inline: Data?
 }
 
-public struct LoadedTrack {
+struct LoadedTrack {
     public var report: TrackReport
     public var samples: [SampleRec]
     public var video: VideoSetup?
@@ -118,7 +118,7 @@ public struct LoadedTrack {
     public var timescale: Int
 }
 
-public struct LoadedMedia {
+struct LoadedMedia {
     public var info: MediaInfo
     /// Backing bytes. Sample payloads stay here until the player asks for one.
     public var source: any MediaByteSource
@@ -131,7 +131,7 @@ public struct LoadedMedia {
     public var matroska: MatroskaIndex?
 }
 
-public struct CinecoreError: Error, CustomStringConvertible {
+struct CinecoreError: Error, CustomStringConvertible {
     public let message: String
     public var description: String { message }
     public init(_ message: String) { self.message = message }

@@ -22,6 +22,12 @@ Vision atoms are attached to that description. This process does not run an
 RPU composer and does not render Atmos objects. The player is compiled only
 for iOS, macOS, and tvOS.
 
+Opening another movie, seeking, or closing cancels the in-flight read and
+bumps a session generation. A callback from the previous open cannot publish
+into the current one. The state is idle, opening, ready, playing, buffering,
+paused, seeking, ended, or failed. `diagnostics.report` is the text to copy
+after a device failure. The rules are in `Documentation/Invariants.md`.
+
 `MediaByteSource` is how bytes are read. `FileByteSource` seeks in a local
 file. `HTTPByteSource` keeps one `URLSession` and sends every `Range` on it,
 so the CDN connection is reused. A short or partial response is an error.

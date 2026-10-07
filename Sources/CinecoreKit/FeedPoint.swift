@@ -2,7 +2,7 @@ import Foundation
 
 /// Where a seek should start feeding. Audio past the last sample stays past
 /// the end, so playback does not jump back to the first audio frame.
-public enum FeedPoint {
+enum FeedPoint {
     public static func video(_ samples: [SampleRec], from start: Double) -> Int {
         var index = 0
         for (i, sample) in samples.enumerated() where sample.key && sample.pts <= start + 0.0008 {
@@ -20,7 +20,7 @@ public enum FeedPoint {
 }
 
 /// Cursor policy for one read. A thrown read leaves the cursor where it is.
-public enum SamplePull {
+enum SamplePull {
     case enqueued(Int, Data)
     case retry(Int)
     case finished

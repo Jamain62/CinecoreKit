@@ -1,9 +1,9 @@
 import Foundation
 
-public enum CinecoreOpen {
+enum CinecoreOpen {
     /// Demux from any random-access source. Sample bytes stay in the source
     /// until something reads a range.
-    public static func open(source: any MediaByteSource, name: String) -> LoadedMedia {
+    static func open(source: any MediaByteSource, name: String) -> LoadedMedia {
         let ext = name.split(separator: ".").last?.lowercased() ?? ""
         let head = source.readOrEmpty(at: 0, count: 16)
         var info = MediaInfo(
@@ -74,18 +74,18 @@ public enum CinecoreOpen {
         return LoadedMedia(info: info, source: source, video: nil, audio: nil, packetSize: nil, headerSkip: nil)
     }
 
-    public static func open(data: Data, name: String) -> LoadedMedia {
+    static func open(data: Data, name: String) -> LoadedMedia {
         open(source: MemoryByteSource(data), name: name)
     }
 
-    public static func open(fileURL: URL) throws -> LoadedMedia {
+    static func open(fileURL: URL) throws -> LoadedMedia {
         let source = try FileByteSource(url: fileURL)
         return open(source: source, name: fileURL.lastPathComponent)
     }
 
     /// HTTP Range requests. The server must answer HEAD with a length and GET
     /// with status 206. This does not download the object first.
-    public static func open(remote url: URL, name: String? = nil) throws -> LoadedMedia {
+    static func open(remote url: URL, name: String? = nil) throws -> LoadedMedia {
         let source = try HTTPByteSource(url: url)
         return open(source: source, name: name ?? url.lastPathComponent)
     }

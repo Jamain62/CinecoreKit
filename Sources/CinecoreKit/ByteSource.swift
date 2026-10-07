@@ -6,7 +6,7 @@ import FoundationNetworking
 /// Random-access bytes. Demuxers read the container structure. The player reads
 /// a sample when the display asks for it. Nothing here downloads a whole remote
 /// object up front.
-public protocol MediaByteSource: AnyObject, Sendable {
+protocol MediaByteSource: AnyObject, Sendable {
     var length: Int64 { get }
     func read(at offset: Int64, count: Int) throws -> Data
     /// The exact range. Playback may widen a read into a cache block.
@@ -14,10 +14,14 @@ public protocol MediaByteSource: AnyObject, Sendable {
     func readExact(at offset: Int64, count: Int) throws -> Data
     /// Remote Matroska sets this so open returns after the first cluster.
     var indexesIncrementally: Bool { get }
+    var isWorkCancelled: Bool { get }
+    func cancelWork()
 }
 
 extension MediaByteSource {
     public var indexesIncrementally: Bool { false }
+    public var isWorkCancelled: Bool { false }
+    public func cancelWork() {}
 
     public func readExact(at offset: Int64, count: Int) throws -> Data {
         try read(at: offset, count: count)
@@ -45,11 +49,12 @@ extension MediaByteSource {
     }
 }
 
-public final class MemoryByteSource: MediaByteSource, @unchecked Sendable {
+/// Immutable bytes. `Data` is not mutated, so the type is Sendable without a lock.
+final class MemoryByteSource: MediaByteSource, Sendable {
     private let data: Data
-    public init(_ data: Data) { self.data = data }
-    public var length: Int64 { Int64(data.count) }
-    public func read(at offset: Int64, count: Int) throws -> Data {
+    init(_ data: Data) { self.data = data }
+    var length: Int64 { Int64(data.count) }
+    func read(at offset: Int64, count: Int) throws -> Data {
         guard offset >= 0, count > 0 else { return Data() }
         let start = Int(offset)
         if start >= data.count || start < 0 { return Data() }
@@ -58,12 +63,14 @@ public final class MemoryByteSource: MediaByteSource, @unchecked Sendable {
     }
 }
 
-public final class FileByteSource: MediaByteSource, @unchecked Sendable {
+/// The file handle is not Sendable. Every seek/read holds `lock`, and nothing
+/// else touches the handle. That is the reason for the unchecked conformance.
+final class FileByteSource: MediaByteSource, @unchecked Sendable {
     private let handle: FileHandle
     private let lock = NSLock()
-    public let length: Int64
+    let length: Int64
 
-    public init(url: URL) throws {
+    init(url: URL) throws {
         let handle = try FileHandle(forReadingFrom: url)
         self.handle = handle
         length = Int64(try handle.seekToEnd())
@@ -71,7 +78,7 @@ public final class FileByteSource: MediaByteSource, @unchecked Sendable {
 
     deinit { try? handle.close() }
 
-    public func read(at offset: Int64, count: Int) throws -> Data {
+    func read(at offset: Int64, count: Int) throws -> Data {
         guard offset >= 0, count > 0, offset < length else { return Data() }
         let n = Int(min(Int64(count), length - offset))
         lock.lock()
@@ -81,22 +88,35 @@ public final class FileByteSource: MediaByteSource, @unchecked Sendable {
     }
 }
 
-public final class HTTPByteSource: MediaByteSource, @unchecked Sendable {
-    public let length: Int64
-    public let url: URL
-    public var indexesIncrementally: Bool { true }
+/// URLSession and the block cache are mutable. The cache, the stats, and the
+/// task list are only touched under `lock`. Delegate callbacks go through
+/// `HTTPBridge`, which has its own lock. Unchecked is required because
+/// `URLSession` is not Sendable. The cache holds at most `maxBlocks` blocks.
+final class HTTPByteSource: MediaByteSource, @unchecked Sendable {
+    let length: Int64
+    let url: URL
+    var indexesIncrementally: Bool { true }
     private let bridge: HTTPBridge
     private let session: URLSession
     private let timeout: TimeInterval
     private let lock = NSLock()
     private var blocks: [Int64: Data] = [:]
     private var order: [Int64] = []
+    private var tasks: [URLSessionTask] = []
+    private var token = CancelToken()
+    private var requestCount = 0
+    private var byteCount = 0
+    private var retryCount = 0
+    private var lastStatus = 0
+    private var lastError = ""
+    private var started: Date?
     private let blockSize = 256 * 1024
+    /// 48 × 256 KB = 12 MB. Older blocks are dropped.
     private let maxBlocks = 48
 
     /// One session for the life of the source. Range reads are tasks on that
     /// session, so TLS and the CDN connection stay up across samples.
-    public init(url: URL, timeout: TimeInterval = 20) throws {
+    init(url: URL, timeout: TimeInterval = 20) throws {
         self.url = url
         self.timeout = timeout
         let bridge = HTTPBridge()
@@ -116,15 +136,45 @@ public final class HTTPByteSource: MediaByteSource, @unchecked Sendable {
 
     deinit { session.invalidateAndCancel() }
 
+    var isWorkCancelled: Bool { token.isCancelled }
+
+    func cancelWork() {
+        token.cancel()
+        lock.lock()
+        let live = tasks
+        lock.unlock()
+        live.forEach { $0.cancel() }
+    }
+
+    func attach(_ token: CancelToken) {
+        lock.lock()
+        self.token = token
+        lock.unlock()
+    }
+
+    var cachedBlockCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return blocks.count
+    }
+
+    var transport: (requests: Int, bytes: Int, retries: Int, status: Int, error: String, perSecond: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        let elapsed = started.map { Date().timeIntervalSince($0) } ?? 0
+        let rate = elapsed > 0.05 ? Double(byteCount) / elapsed : 0
+        return (requestCount, byteCount, retryCount, lastStatus, lastError, rate)
+    }
+
     /// Bypasses the 256 KB cache. Indexing uses this so a block header does not download the frame.
-    public func readExact(at offset: Int64, count: Int) throws -> Data {
+    func readExact(at offset: Int64, count: Int) throws -> Data {
         guard offset >= 0, count > 0 else { return Data() }
         if offset >= length { return Data() }
         let n = Int(min(Int64(count), length - offset))
         return try fetch(offset, n)
     }
 
-    public func read(at offset: Int64, count: Int) throws -> Data {
+    func read(at offset: Int64, count: Int) throws -> Data {
         guard offset >= 0, count > 0 else { return Data() }
         if offset >= length { return Data() }
         let n = Int(min(Int64(count), length - offset))
@@ -175,30 +225,63 @@ public final class HTTPByteSource: MediaByteSource, @unchecked Sendable {
     }
 
     private func fetch(_ offset: Int64, _ count: Int) throws -> Data {
+        if token.isCancelled { throw CinecoreFailure(.cancelled, "Read cancelled.") }
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.setValue("bytes=\(offset)-\(offset + Int64(count) - 1)", forHTTPHeaderField: "Range")
         return try perform(request, expect: count, allow: [206])
     }
 
     private func perform(_ request: URLRequest, expect: Int?, allow: Set<Int>) throws -> Data {
+        if token.isCancelled { throw CinecoreFailure(.cancelled, "Read cancelled.") }
         let transfer = Transfer(expect: expect, allow: allow)
         let task = session.dataTask(with: request)
+        lock.lock()
+        tasks.append(task)
+        requestCount += 1
+        if started == nil { started = Date() }
+        lock.unlock()
         bridge.track(task.taskIdentifier, transfer)
         task.resume()
+        if token.isCancelled { task.cancel() }
         if transfer.sem.wait(timeout: .now() + timeout + 5) == .timedOut {
             task.cancel()
-            throw CinecoreError("Timed out reading \(url.host ?? "remote").")
+            note(status: 0, bytes: 0, error: "Timed out reading \(url.host ?? "remote").", retry: true)
+            throw CinecoreFailure(.network, "Timed out reading \(url.host ?? "remote").")
         }
         bridge.forget(task.taskIdentifier)
+        lock.lock()
+        tasks.removeAll { $0 === task }
+        lock.unlock()
         let snap = transfer.snapshot()
-        if let failure = snap.failure { throw failure }
+        if token.isCancelled {
+            throw CinecoreFailure(.cancelled, "Read cancelled.")
+        }
+        if let failure = snap.failure {
+            let typed = classify(failure)
+            note(status: snap.status, bytes: snap.body.count, error: typed.message, retry: typed.code == .network)
+            throw typed
+        }
         if !allow.contains(snap.status) {
-            throw CinecoreError("Server did not honor the byte range (HTTP \(snap.status)). A 60 GB remux cannot be pulled in one response.")
+            let message = "Server did not honor the byte range (HTTP \(snap.status))."
+            note(status: snap.status, bytes: snap.body.count, error: message, retry: false)
+            throw CinecoreFailure(.httpRange, message)
         }
         if let expect, snap.body.count != expect {
-            throw CinecoreError("Short range response: got \(snap.body.count) of \(expect) bytes.")
+            let message = "Short range response: got \(snap.body.count) of \(expect) bytes."
+            note(status: snap.status, bytes: snap.body.count, error: message, retry: false)
+            throw CinecoreFailure(.httpRange, message)
         }
+        note(status: snap.status, bytes: snap.body.count, error: "", retry: false)
         return snap.body
+    }
+
+    private func note(status: Int, bytes: Int, error: String, retry: Bool) {
+        lock.lock()
+        lastStatus = status
+        byteCount += bytes
+        if retry { retryCount += 1 }
+        if !error.isEmpty { lastError = error }
+        lock.unlock()
     }
 
     private static func probeLength(url: URL, session: URLSession, bridge: HTTPBridge, timeout: TimeInterval) throws -> Int64 {
@@ -239,6 +322,8 @@ public final class HTTPByteSource: MediaByteSource, @unchecked Sendable {
     }
 }
 
+/// Delegate callbacks arrive on the session queue. `inflight` is only used
+/// under `lock`. URLSession requires an NSObject delegate, which cannot be an actor.
 private final class HTTPBridge: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var inflight: [Int: Transfer] = [:]
@@ -283,6 +368,8 @@ private final class HTTPBridge: NSObject, URLSessionDataDelegate, @unchecked Sen
     }
 }
 
+/// The semaphore is waited on the caller. The body is appended on the session
+/// queue. Both sides take `lock` before touching the buffers.
 private final class Transfer: @unchecked Sendable {
     let sem = DispatchSemaphore(value: 0)
     /// Nil skips the body-length check. Used for HEAD.

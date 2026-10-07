@@ -23,6 +23,9 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
     @Published public private(set) var detail = "Standby"
     @Published public private(set) var buffering = false
     @Published public private(set) var lastError: String?
+    @Published public private(set) var state: PlaybackState = .idle
+    @Published public private(set) var failure: CinecoreFailure?
+    @Published public private(set) var diagnostics = CinecoreDiagnostics()
 
     public let view: CinecorePlayerView
     private let display = AVSampleBufferDisplayLayer()
@@ -43,6 +46,8 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
     private var videoDelay = 0.4
     private var audioDelay = 0.4
     private var readyDetail = "Standby"
+    private var droppedVideo = 0
+    private let session = PlayerSession()
     private let mediaQueue = DispatchQueue(label: "cinecore.samples")
     private let cursorLock = NSLock()
     private var ticker: Timer?
@@ -58,40 +63,66 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
     }
 
     public func open(data: Data, name: String) {
-        adopt(CinecoreOpen.open(data: data, name: name))
+        releaseSource()
+        let generation = session.beginOpen()
+        publish()
+        let opened = CinecoreOpen.open(data: data, name: name)
+        guard session.isCurrent(generation) else { return }
+        adopt(opened, generation: generation)
     }
 
     public func open(fileURL: URL) {
+        releaseSource()
+        let generation = session.beginOpen()
+        publish()
         do {
-            adopt(try CinecoreOpen.open(fileURL: fileURL))
+            let opened = try CinecoreOpen.open(fileURL: fileURL)
+            guard session.isCurrent(generation) else { return }
+            adopt(opened, generation: generation)
         } catch {
-            lastError = error.localizedDescription
-            detail = lastError ?? "Unreadable file."
+            guard session.isCurrent(generation) else { return }
+            let failure = classify(error)
+            _ = session.adopt(generation, .failed(failure))
+            self.failure = failure
+            lastError = failure.message
+            detail = failure.message
+            publish()
         }
     }
 
     public func open(remote url: URL) {
-        buffering = true
+        releaseSource()
+        let generation = session.beginOpen()
         detail = "Opening"
         lastError = nil
+        failure = nil
+        publish()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
                 let opened = try CinecoreOpen.open(remote: url)
                 DispatchQueue.main.async {
-                    self?.buffering = false
-                    self?.adopt(opened)
+                    guard let self, self.session.isCurrent(generation) else {
+                        (opened.source as? HTTPByteSource)?.cancelWork()
+                        return
+                    }
+                    (opened.source as? HTTPByteSource)?.attach(self.session.currentToken)
+                    self.adopt(opened, generation: generation)
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self?.buffering = false
-                    self?.lastError = error.localizedDescription
-                    self?.detail = self?.lastError ?? "Remote open failed."
+                    guard let self, self.session.isCurrent(generation) else { return }
+                    let failure = classify(error)
+                    _ = self.session.adopt(generation, .failed(failure))
+                    self.failure = failure
+                    self.lastError = failure.message
+                    self.detail = failure.message
+                    self.publish()
                 }
             }
         }
     }
 
-    private func adopt(_ opened: LoadedMedia) {
+    private func adopt(_ opened: LoadedMedia, generation: UInt64) {
         stopFeeding()
         stopTicker()
         sync.rate = 0
@@ -111,7 +142,13 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
         audioCursor = 0
         guard let video = opened.video, let setup = video.video else {
             decodePath = "metadata"
-            detail = opened.info.warnings.first ?? "No picture track."
+            let message = opened.info.warnings.first ?? "No picture track."
+            let failure = CinecoreFailure(.unsupported, message)
+            _ = session.adopt(generation, .failed(failure))
+            self.failure = failure
+            lastError = message
+            detail = message
+            publish()
             return
         }
         family = setup.family
@@ -120,8 +157,13 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
             videoFormat = makeVideoFormat(setup)
             if videoFormat == nil {
                 decodePath = "metadata"
-                detail = "VideoToolbox rejected the \(video.report.codecLabel) parameter sets."
-                lastError = detail
+                let failure = CinecoreFailure(.decoder, "VideoToolbox rejected the \(video.report.codecLabel) parameter sets.")
+                _ = session.adopt(generation, .failed(failure))
+                self.failure = failure
+                lastError = failure.message
+                detail = failure.message
+                publish()
+                return
             } else {
                 decodePath = "VideoToolbox"
                 readyDetail = video.report.codecLabel
@@ -151,13 +193,20 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
                 audioAttached = true
             }
         }
+        if case .failed = session.currentState { return }
+        _ = session.adopt(generation, .ready)
+        failure = nil
+        lastError = nil
+        publish()
     }
 
     public func play() {
-        guard let media, videoFormat != nil || family == .jpeg else {
+        guard videoFormat != nil || family == .jpeg else {
             lastError = lastError ?? "Nothing playable is open."
             return
         }
+        guard session.adopt(session.currentGeneration, .playing) else { return }
+        publish()
         if family == .jpeg {
             playing = true
             startTicker()
@@ -174,50 +223,66 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
             time = CMTimeGetSeconds(CMTimebaseGetTime(timebase))
         }
         sync.rate = 0
-        playing = false
+        _ = session.adopt(session.currentGeneration, .paused)
+        publish()
         stopTicker()
     }
 
     public func seek(to seconds: Double) {
         let target = max(0, min(seconds, duration))
-        time = target
-        guard videoFormat != nil else { return }
-        let was = playing
+        let wasPlaying = playing
+        guard let generation = session.beginSeek() else { return }
+        publish()
         sync.rate = 0
         stopFeeding()
         display.flush()
         audioRenderer.flush()
         sync.setRate(0, time: CMTime(seconds: target, preferredTimescale: 600))
+        (media?.source as? HTTPByteSource)?.cancelWork()
+        (media?.source as? HTTPByteSource)?.attach(session.currentToken)
         let index = media?.matroska
-        buffering = index != nil
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let step = index?.index(covering: target) ?? .advanced
             DispatchQueue.main.async {
-                guard let self else { return }
-                self.buffering = false
+                guard let self, self.session.isCurrent(generation) else { return }
                 switch step {
+                case .cancelled:
+                    return
                 case .retry:
                     self.workerRetries += 1
-                    if self.workerRetries > 8 {
-                        self.lastError = index?.lastIndexError ?? "Could not index that position."
-                        self.detail = self.lastError ?? ""
-                        break
+                    guard self.workerRetries <= 8, self.session.adopt(generation, .buffering) else {
+                        let failure = CinecoreFailure(.seek, index?.lastIndexError ?? "Could not index that position.")
+                        _ = self.session.adopt(generation, .failed(failure))
+                        self.failure = failure
+                        self.lastError = failure.message
+                        self.detail = failure.message
+                        self.publish()
+                        return
                     }
-                    self.buffering = true
                     self.detail = "Buffering"
+                    self.publish()
                     let delay = min(0.4 * pow(2, Double(self.workerRetries - 1)), 5)
                     self.mediaQueue.asyncAfter(deadline: .now() + delay) {
-                        DispatchQueue.main.async { self.seek(to: target) }
+                        DispatchQueue.main.async {
+                            guard self.session.isCurrent(generation) else { return }
+                            self.seek(to: target)
+                        }
                     }
                 case .malformed:
-                    self.lastError = index?.lastIndexError ?? "Could not index that position."
-                    self.detail = self.lastError ?? ""
+                    let failure = CinecoreFailure(.indexing, index?.lastIndexError ?? "Could not index that position.")
+                    _ = self.session.adopt(generation, .failed(failure))
+                    self.failure = failure
+                    self.lastError = failure.message
+                    self.detail = failure.message
+                    self.publish()
                 case .advanced, .endOfFile:
                     self.workerRetries = 0
+                    let next: PlaybackState = wasPlaying ? .playing : .paused
+                    _ = self.session.adopt(generation, next)
+                    self.publish()
                     self.startFeeding(from: target)
-                    if was {
+                    if wasPlaying {
                         self.sync.rate = 1
-                        self.playing = true
                     }
                 }
             }
@@ -225,8 +290,11 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
     }
 
     public func close() {
-        pause()
+        releaseSource()
+        _ = session.close()
+        pauseClock()
         stopFeeding()
+        stopTicker()
         display.flush()
         audioRenderer.flush()
         cursorLock.lock()
@@ -237,8 +305,78 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
         audioFormat = nil
         decodePath = "not open"
         detail = "Standby"
+        readyDetail = "Standby"
         time = 0
         duration = 0
+        failure = nil
+        lastError = nil
+        droppedVideo = 0
+        diagnostics = CinecoreDiagnostics()
+        publish()
+    }
+
+    private func pauseClock() {
+        sync.rate = 0
+    }
+
+    private func releaseSource() {
+        (media?.source as? HTTPByteSource)?.cancelWork()
+    }
+
+    private func publish() {
+        let next = session.currentState
+        state = next
+        playing = next == .playing
+        buffering = next == .buffering || next == .opening || next == .seeking
+        if case .failed(let error) = next {
+            failure = error
+            lastError = error.message
+        }
+        diagnostics = makeDiagnostics()
+        detail = diagnostics.detail.isEmpty ? detail : detail
+    }
+
+    private func makeDiagnostics() -> CinecoreDiagnostics {
+        var snap = CinecoreDiagnostics()
+        snap.state = String(describing: session.currentState)
+        snap.detail = detail
+        snap.time = time
+        snap.duration = duration
+        snap.videoSample = videoCursor
+        snap.audioSample = audioCursor
+        snap.droppedVideo = droppedVideo
+        snap.lastError = failure?.message ?? lastError ?? ""
+        if let media {
+            snap.container = media.info.container
+            snap.name = media.info.name
+            if let video = media.video {
+                snap.videoCodec = video.report.codecLabel
+                snap.hdr = video.report.hdr.label
+            }
+            if let audio = media.audio {
+                snap.audioCodec = audio.report.audio?.codecLabel ?? audio.report.codecLabel
+                snap.audioLayout = audio.report.audio?.layout ?? ""
+                if audio.report.audio?.atmos == true { snap.audioLayout += " Atmos" }
+            }
+            if let span = media.matroska?.indexedSpan() {
+                snap.indexedStart = span.0
+                snap.indexedEnd = span.1
+            }
+            if let http = media.source as? HTTPByteSource {
+                let transport = http.transport
+                snap.requests = transport.requests
+                snap.bytes = transport.bytes
+                snap.retries = transport.retries
+                snap.lastStatus = transport.status
+                if !transport.error.isEmpty { snap.lastError = transport.error }
+                snap.bytesPerSecond = transport.perSecond
+            }
+        }
+        if let timebase = sync.timebase {
+            let clock = CMTimeGetSeconds(CMTimebaseGetTime(timebase))
+            if clock.isFinite { snap.avOffset = time - clock }
+        }
+        return snap
     }
 
     private func listedCount(_ media: LoadedMedia, video: Bool) -> Int {
@@ -304,6 +442,8 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
             DispatchQueue.main.async {
                 guard let self, generation == self.feedGeneration else { return }
                 switch step {
+                case .cancelled:
+                    return
                 case .retry:
                     self.workerRetries += 1
                     if self.workerRetries > 8 {
@@ -338,13 +478,15 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
         audioRenderer.stopRequestingMediaData()
         cursorLock.lock()
         feedGeneration += 1
+        let generation = feedGeneration
         bufferHolds = 0
         videoDelay = 0.4
         audioDelay = 0.4
         cursorLock.unlock()
         feeding = false
         DispatchQueue.main.async { [weak self] in
-            self?.buffering = false
+            guard let self, generation == self.feedGeneration else { return }
+            self.publish()
         }
     }
 
@@ -372,6 +514,9 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
                 switch step {
                 case .advanced:
                     continue
+                case .cancelled:
+                    display.stopRequestingMediaData()
+                    return
                 case .retry:
                     holdForBuffer(generation, video: true)
                     return
@@ -440,6 +585,9 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
                 switch step {
                 case .advanced:
                     continue
+                case .cancelled:
+                    audioRenderer.stopRequestingMediaData()
+                    return
                 case .retry:
                     holdForBuffer(generation, video: false)
                     return
