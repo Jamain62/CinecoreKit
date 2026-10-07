@@ -98,21 +98,48 @@ public struct CinecoreDiagnostics: Equatable, Sendable {
     }
 }
 
-/// Set from any queue. The flag is only read and written under the lock.
+/// Set from any queue. The flag and the cancel hooks are only touched under the lock.
+/// Cancelling runs the hooks after the lock is released, so a hook can abort a socket
+/// without deadlocking against the flag.
 final class CancelToken: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
+    private var hooks: [() -> Void] = []
 
     func cancel() {
         lock.lock()
         cancelled = true
+        let pending = hooks
+        hooks.removeAll()
         lock.unlock()
+        pending.forEach { $0() }
     }
 
     var isCancelled: Bool {
         lock.lock()
         defer { lock.unlock() }
         return cancelled
+    }
+
+    /// If the token is already cancelled the hook runs immediately.
+    func onCancel(_ hook: @escaping () -> Void) {
+        lock.lock()
+        let already = cancelled
+        if !already { hooks.append(hook) }
+        lock.unlock()
+        if already { hook() }
+    }
+}
+
+/// `playing` and `buffering` are derived from the state. They are never both true.
+func playbackFlags(_ state: PlaybackState) -> (playing: Bool, buffering: Bool) {
+    switch state {
+    case .playing:
+        return (true, false)
+    case .buffering, .opening, .seeking:
+        return (false, true)
+    case .idle, .ready, .paused, .ended, .failed:
+        return (false, false)
     }
 }
 
@@ -215,9 +242,9 @@ private func legal(_ from: PlaybackState, _ to: PlaybackState) -> Bool {
         return true
     case (.playing, .buffering), (.playing, .paused), (.playing, .seeking), (.playing, .ended), (.playing, .failed), (.playing, .idle):
         return true
-    case (.buffering, .playing), (.buffering, .paused), (.buffering, .seeking), (.buffering, .failed), (.buffering, .idle):
+    case (.buffering, .playing), (.buffering, .paused), (.buffering, .seeking), (.buffering, .ended), (.buffering, .failed), (.buffering, .idle):
         return true
-    case (.paused, .playing), (.paused, .seeking), (.paused, .idle), (.paused, .failed):
+    case (.paused, .playing), (.paused, .buffering), (.paused, .seeking), (.paused, .ended), (.paused, .idle), (.paused, .failed):
         return true
     case (.seeking, .ready), (.seeking, .playing), (.seeking, .paused), (.seeking, .buffering), (.seeking, .failed), (.seeking, .idle):
         return true
@@ -227,5 +254,122 @@ private func legal(_ from: PlaybackState, _ to: PlaybackState) -> Bool {
         return true
     default:
         return false
+    }
+}
+
+/// Cursors, the feed generation, and the buffer-hold count. The sample queue
+/// and the main queue both touch these. Every access takes `lock`. That is the
+/// isolation. The type is unchecked because it is shared on purpose.
+final class FeedGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var generation = 0
+    private var holds = 0
+    private var videoAt = 0
+    private var audioAt = 0
+    private var videoDelay = 0.4
+    private var audioDelay = 0.4
+    private var loaded: LoadedMedia?
+
+    func bump() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        generation += 1
+        holds = 0
+        videoDelay = 0.4
+        audioDelay = 0.4
+        return generation
+    }
+
+    func isCurrent(_ generation: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return self.generation == generation
+    }
+
+    func holdCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return holds
+    }
+
+    func positions() -> (video: Int, audio: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (videoAt, audioAt)
+    }
+
+    /// False when a newer feed has started. The cursors are left alone.
+    func arm(video: Int, audio: Int, generation: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard self.generation == generation else { return false }
+        videoAt = video
+        audioAt = audio
+        holds = 0
+        videoDelay = 0.4
+        audioDelay = 0.4
+        return true
+    }
+
+    func storeVideo(_ next: Int, generation: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard self.generation == generation else { return false }
+        videoAt = next
+        videoDelay = 0.4
+        return true
+    }
+
+    func storeAudio(_ next: Int, generation: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard self.generation == generation else { return false }
+        audioAt = next
+        audioDelay = 0.4
+        return true
+    }
+
+    func videoIfCurrent(_ generation: Int) -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard self.generation == generation else { return nil }
+        return videoAt
+    }
+
+    func audioIfCurrent(_ generation: Int) -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard self.generation == generation else { return nil }
+        return audioAt
+    }
+
+    func beginHold(video: Bool) -> Double {
+        lock.lock()
+        defer { lock.unlock() }
+        holds += 1
+        let delay = video ? videoDelay : audioDelay
+        if video { videoDelay = min(videoDelay * 2, 5) } else { audioDelay = min(audioDelay * 2, 5) }
+        return delay
+    }
+
+    /// `(still this feed, some hold is still outstanding)`
+    func finishHold(_ generation: Int) -> (live: Bool, waiting: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        let live = self.generation == generation
+        if live { holds = max(0, holds - 1) }
+        return (live, holds > 0)
+    }
+
+    func setMedia(_ media: LoadedMedia?) {
+        lock.lock()
+        loaded = media
+        lock.unlock()
+    }
+
+    func currentMedia() -> LoadedMedia? {
+        lock.lock()
+        defer { lock.unlock() }
+        return loaded
     }
 }

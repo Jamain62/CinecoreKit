@@ -85,8 +85,8 @@ enum CinecoreOpen {
 
     /// HTTP Range requests. The server must answer HEAD with a length and GET
     /// with status 206. This does not download the object first.
-    static func open(remote url: URL, name: String? = nil) throws -> LoadedMedia {
-        let source = try HTTPByteSource(url: url)
+    static func open(remote url: URL, name: String? = nil, token: CancelToken = CancelToken()) throws -> LoadedMedia {
+        let source = try HTTPByteSource(url: url, token: token)
         return open(source: source, name: name ?? url.lastPathComponent)
     }
 }

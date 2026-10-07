@@ -88,6 +88,32 @@ final class FileByteSource: MediaByteSource, @unchecked Sendable {
     }
 }
 
+/// The in-flight list is shared by the length probe and later reads.
+/// `URLSessionTask` is not Sendable. The array is only touched under `lock`.
+private final class TaskList: @unchecked Sendable {
+    private let lock = NSLock()
+    private var tasks: [URLSessionTask] = []
+
+    func add(_ task: URLSessionTask) {
+        lock.lock()
+        tasks.append(task)
+        lock.unlock()
+    }
+
+    func remove(_ task: URLSessionTask) {
+        lock.lock()
+        tasks.removeAll { $0 === task }
+        lock.unlock()
+    }
+
+    func cancelAll() {
+        lock.lock()
+        let live = tasks
+        lock.unlock()
+        live.forEach { $0.cancel() }
+    }
+}
+
 /// URLSession and the block cache are mutable. The cache, the stats, and the
 /// task list are only touched under `lock`. Delegate callbacks go through
 /// `HTTPBridge`, which has its own lock. Unchecked is required because
@@ -102,8 +128,8 @@ final class HTTPByteSource: MediaByteSource, @unchecked Sendable {
     private let lock = NSLock()
     private var blocks: [Int64: Data] = [:]
     private var order: [Int64] = []
-    private var tasks: [URLSessionTask] = []
-    private var token = CancelToken()
+    private let tasks: TaskList
+    private var token: CancelToken
     private var requestCount = 0
     private var byteCount = 0
     private var retryCount = 0
@@ -116,9 +142,10 @@ final class HTTPByteSource: MediaByteSource, @unchecked Sendable {
 
     /// One session for the life of the source. Range reads are tasks on that
     /// session, so TLS and the CDN connection stay up across samples.
-    init(url: URL, timeout: TimeInterval = 20) throws {
+    init(url: URL, timeout: TimeInterval = 20, token: CancelToken = CancelToken()) throws {
         self.url = url
         self.timeout = timeout
+        self.token = token
         let bridge = HTTPBridge()
         let config = URLSessionConfiguration.ephemeral
         config.urlCache = nil
@@ -130,26 +157,33 @@ final class HTTPByteSource: MediaByteSource, @unchecked Sendable {
         let session = URLSession(configuration: config, delegate: bridge, delegateQueue: nil)
         self.bridge = bridge
         self.session = session
-        length = try Self.probeLength(url: url, session: session, bridge: bridge, timeout: timeout)
-        if length <= 0 { throw CinecoreError("Remote object has no length.") }
+        let live = TaskList()
+        self.tasks = live
+        token.onCancel { live.cancelAll() }
+        length = try Self.probeLength(url: url, session: session, bridge: bridge, timeout: timeout, token: token, tasks: live)
+        if length <= 0 { throw CinecoreFailure(.network, "Remote object has no length.") }
     }
 
     deinit { session.invalidateAndCancel() }
 
-    var isWorkCancelled: Bool { token.isCancelled }
+    var isWorkCancelled: Bool { currentToken().isCancelled }
 
     func cancelWork() {
-        token.cancel()
-        lock.lock()
-        let live = tasks
-        lock.unlock()
-        live.forEach { $0.cancel() }
+        currentToken().cancel()
     }
 
     func attach(_ token: CancelToken) {
         lock.lock()
         self.token = token
+        let tasks = self.tasks
         lock.unlock()
+        token.onCancel { tasks.cancelAll() }
+    }
+
+    private func currentToken() -> CancelToken {
+        lock.lock()
+        defer { lock.unlock() }
+        return token
     }
 
     var cachedBlockCount: Int {
@@ -225,35 +259,34 @@ final class HTTPByteSource: MediaByteSource, @unchecked Sendable {
     }
 
     private func fetch(_ offset: Int64, _ count: Int) throws -> Data {
-        if token.isCancelled { throw CinecoreFailure(.cancelled, "Read cancelled.") }
+        let active = currentToken()
+        if active.isCancelled { throw CinecoreFailure(.cancelled, "Read cancelled.") }
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.setValue("bytes=\(offset)-\(offset + Int64(count) - 1)", forHTTPHeaderField: "Range")
-        return try perform(request, expect: count, allow: [206])
+        return try perform(request, expect: count, allow: [206], token: active)
     }
 
-    private func perform(_ request: URLRequest, expect: Int?, allow: Set<Int>) throws -> Data {
+    private func perform(_ request: URLRequest, expect: Int?, allow: Set<Int>, token: CancelToken) throws -> Data {
         if token.isCancelled { throw CinecoreFailure(.cancelled, "Read cancelled.") }
         let transfer = Transfer(expect: expect, allow: allow)
         let task = session.dataTask(with: request)
+        tasks.add(task)
         lock.lock()
-        tasks.append(task)
         requestCount += 1
         if started == nil { started = Date() }
         lock.unlock()
         bridge.track(task.taskIdentifier, transfer)
         task.resume()
         if token.isCancelled { task.cancel() }
-        if transfer.sem.wait(timeout: .now() + timeout + 5) == .timedOut {
+        guard wait(transfer, token: token, timeout: timeout + 5) else {
             task.cancel()
             note(status: 0, bytes: 0, error: "Timed out reading \(url.host ?? "remote").", retry: true)
             throw CinecoreFailure(.network, "Timed out reading \(url.host ?? "remote").")
         }
         bridge.forget(task.taskIdentifier)
-        lock.lock()
-        tasks.removeAll { $0 === task }
-        lock.unlock()
+        tasks.remove(task)
         let snap = transfer.snapshot()
-        if token.isCancelled {
+        if token.isCancelled || currentToken().isCancelled {
             throw CinecoreFailure(.cancelled, "Read cancelled.")
         }
         if let failure = snap.failure {
@@ -275,6 +308,16 @@ final class HTTPByteSource: MediaByteSource, @unchecked Sendable {
         return snap.body
     }
 
+    /// Polls so a cancel is noticed even when the session does not complete the task promptly.
+    private func wait(_ transfer: Transfer, token: CancelToken, timeout: TimeInterval) -> Bool {
+        let limit = Date().addingTimeInterval(timeout)
+        while Date() < limit {
+            if token.isCancelled { return true }
+            if transfer.sem.wait(timeout: .now() + 0.05) == .success { return true }
+        }
+        return token.isCancelled
+    }
+
     private func note(status: Int, bytes: Int, error: String, retry: Bool) {
         lock.lock()
         lastStatus = status
@@ -284,39 +327,60 @@ final class HTTPByteSource: MediaByteSource, @unchecked Sendable {
         lock.unlock()
     }
 
-    private static func probeLength(url: URL, session: URLSession, bridge: HTTPBridge, timeout: TimeInterval) throws -> Int64 {
-        if let n = try headLength(url: url, session: session, bridge: bridge, timeout: timeout), n > 0 {
+    private static func probeLength(url: URL, session: URLSession, bridge: HTTPBridge, timeout: TimeInterval, token: CancelToken, tasks: TaskList) throws -> Int64 {
+        if token.isCancelled { throw CinecoreFailure(.cancelled, "Read cancelled.") }
+        if let n = try headLength(url: url, session: session, bridge: bridge, timeout: timeout, token: token, tasks: tasks), n > 0 {
             return n
         }
+        if token.isCancelled { throw CinecoreFailure(.cancelled, "Read cancelled.") }
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.setValue("bytes=0-0", forHTTPHeaderField: "Range")
         let transfer = Transfer(expect: 1, allow: [206])
         let task = session.dataTask(with: request)
+        tasks.add(task)
         bridge.track(task.taskIdentifier, transfer)
         task.resume()
-        if transfer.sem.wait(timeout: .now() + timeout) == .timedOut {
-            task.cancel()
-            throw CinecoreError("Timed out asking for the length of \(url.absoluteString).")
+        if token.isCancelled { task.cancel() }
+        let limit = Date().addingTimeInterval(timeout)
+        var finished = false
+        while Date() < limit {
+            if token.isCancelled { task.cancel(); finished = true; break }
+            if transfer.sem.wait(timeout: .now() + 0.05) == .success { finished = true; break }
         }
+        if !finished { task.cancel() }
         bridge.forget(task.taskIdentifier)
+        tasks.remove(task)
+        if token.isCancelled { throw CinecoreFailure(.cancelled, "Read cancelled.") }
+        if !finished {
+            throw CinecoreFailure(.network, "Timed out asking for the length of \(url.absoluteString).")
+        }
         let snap = transfer.snapshot()
         if snap.length > 1 { return snap.length }
-        if let failure = snap.failure { throw failure }
-        throw CinecoreError("The server did not say how long \(url.lastPathComponent) is. HEAD had no length and Range bytes=0-0 had no Content-Range total.")
+        if let failure = snap.failure { throw classify(failure) }
+        throw CinecoreFailure(.httpRange, "The server did not say how long \(url.lastPathComponent) is. HEAD had no length and Range bytes=0-0 had no Content-Range total.")
     }
 
-    private static func headLength(url: URL, session: URLSession, bridge: HTTPBridge, timeout: TimeInterval) throws -> Int64? {
+    private static func headLength(url: URL, session: URLSession, bridge: HTTPBridge, timeout: TimeInterval, token: CancelToken, tasks: TaskList) throws -> Int64? {
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = "HEAD"
+        if token.isCancelled { throw CinecoreFailure(.cancelled, "Read cancelled.") }
         let transfer = Transfer(expect: nil, allow: [200])
         let task = session.dataTask(with: request)
+        tasks.add(task)
         bridge.track(task.taskIdentifier, transfer)
         task.resume()
-        if transfer.sem.wait(timeout: .now() + timeout) == .timedOut {
-            task.cancel()
-            return nil
+        if token.isCancelled { task.cancel() }
+        let limit = Date().addingTimeInterval(timeout)
+        var finished = false
+        while Date() < limit {
+            if token.isCancelled { task.cancel(); finished = true; break }
+            if transfer.sem.wait(timeout: .now() + 0.05) == .success { finished = true; break }
         }
+        if !finished { task.cancel() }
         bridge.forget(task.taskIdentifier)
+        tasks.remove(task)
+        if token.isCancelled { throw CinecoreFailure(.cancelled, "Read cancelled.") }
+        if !finished { return nil }
         let snap = transfer.snapshot()
         return snap.length > 0 ? snap.length : nil
     }

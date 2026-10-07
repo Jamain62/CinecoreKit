@@ -8,9 +8,14 @@ These are the rules later changes have to keep. Breaking one of them shows up as
 
 `beginOpen` and `close` are legal from every state. Other changes have to match the edges in `legal`. An illegal edge is ignored. The state stays where it was.
 
+## Buffering
+
+`.buffering` is a session state, not a Boolean beside `.playing`. A stall moves `.playing` or `.paused` to `.buffering`. Recovery moves it back. The end of the movie moves the session to `.ended`. `playing` and `buffering` are derived from the state and are never both true. An index that fails eight times, or a malformed index, moves the session to `.failed`.
+
 ## Cancellation
 
-`CancelToken` is the flag for one generation. Closing, opening another movie, or seeking again cancels it. HTTP tasks that were already running are cancelled. `indexAhead` returns `.cancelled` and does not move the frontier. A cancelled read is not a retry and it is not the end of the file.
+The open that creates an `HTTPByteSource` passes that generation's `CancelToken` in before the length probe. Cancelling the token cancels the in-flight tasks, including HEAD. A read of the token pointer takes the source lock. `attach` replaces it under that same lock.
+
 
 ## Active chain versus cache
 

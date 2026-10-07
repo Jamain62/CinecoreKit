@@ -14,6 +14,11 @@ import SwiftUI
 /// `AVSampleBufferAudioRenderer` when the format description can be built.
 /// Dolby Vision atoms are attached to the format description; the RPU itself is
 /// not composited in this process.
+/// Cross-queue counters and the loaded movie live in `FeedGate`, and every
+/// access takes its lock. `PlayerSession` changes are made on the main queue.
+/// `@unchecked` remains only because `AVSampleBufferDisplayLayer` and
+/// `AVSampleBufferAudioRenderer` are not Sendable and are enqueued from the
+/// sample queue, which is the queue `requestMediaDataWhenReady` calls back on.
 public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendable {
     @Published public private(set) var info: MediaInfo?
     @Published public private(set) var time: Double = 0
@@ -38,18 +43,13 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
     private var family: VideoFamily = .other
     private var audioAttached = false
     private var feeding = false
-    private var feedGeneration = 0
-    private var videoCursor = 0
-    private var audioCursor = 0
-    private var bufferHolds = 0
+    private let gate = FeedGate()
+    private var resumeAfterBuffer: PlaybackState = .playing
     private var workerRetries = 0
-    private var videoDelay = 0.4
-    private var audioDelay = 0.4
     private var readyDetail = "Standby"
     private var droppedVideo = 0
     private let session = PlayerSession()
     private let mediaQueue = DispatchQueue(label: "cinecore.samples")
-    private let cursorLock = NSLock()
     private var ticker: Timer?
 
     public override init() {
@@ -99,7 +99,8 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
         publish()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
-                let opened = try CinecoreOpen.open(remote: url)
+                let token = self.session.currentToken
+                let opened = try CinecoreOpen.open(remote: url, token: token)
                 DispatchQueue.main.async {
                     guard let self, self.session.isCurrent(generation) else {
                         (opened.source as? HTTPByteSource)?.cancelWork()
@@ -128,9 +129,8 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
         sync.rate = 0
         display.flush()
         audioRenderer.flush()
-        cursorLock.lock()
         media = opened
-        cursorLock.unlock()
+        gate.setMedia(opened)
         info = opened.info
         duration = opened.info.duration
         time = 0
@@ -138,8 +138,7 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
         lastError = nil
         videoFormat = nil
         audioFormat = nil
-        videoCursor = 0
-        audioCursor = 0
+        _ = gate.bump()
         guard let video = opened.video, let setup = video.video else {
             decodePath = "metadata"
             let message = opened.info.warnings.first ?? "No picture track."
@@ -297,9 +296,8 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
         stopTicker()
         display.flush()
         audioRenderer.flush()
-        cursorLock.lock()
         media = nil
-        cursorLock.unlock()
+        gate.setMedia(nil)
         info = nil
         videoFormat = nil
         audioFormat = nil
@@ -326,8 +324,9 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
     private func publish() {
         let next = session.currentState
         state = next
-        playing = next == .playing
-        buffering = next == .buffering || next == .opening || next == .seeking
+        let flags = playbackFlags(next)
+        playing = flags.playing
+        buffering = flags.buffering
         if case .failed(let error) = next {
             failure = error
             lastError = error.message
@@ -342,8 +341,9 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
         snap.detail = detail
         snap.time = time
         snap.duration = duration
-        snap.videoSample = videoCursor
-        snap.audioSample = audioCursor
+        let positions = gate.positions()
+        snap.videoSample = positions.video
+        snap.audioSample = positions.audio
         snap.droppedVideo = droppedVideo
         snap.lastError = failure?.message ?? lastError ?? ""
         if let media {
@@ -408,17 +408,7 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
             videoIndex = FeedPoint.video(media.video?.samples ?? [], from: start)
             audioIndex = FeedPoint.audio(media.audio?.samples ?? [], from: start)
         }
-        cursorLock.lock()
-        guard generation == feedGeneration else {
-            cursorLock.unlock()
-            return
-        }
-        videoCursor = videoIndex
-        audioCursor = audioIndex
-        bufferHolds = 0
-        videoDelay = 0.4
-        audioDelay = 0.4
-        cursorLock.unlock()
+        guard gate.arm(video: videoIndex, audio: audioIndex, generation: generation) else { return }
         display.requestMediaDataWhenReady(on: mediaQueue) { [weak self] in
             self?.supplyVideo(generation)
         }
@@ -431,39 +421,34 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
 
     private func startFeeding(from start: Double) {
         guard let media, media.video != nil else { return }
-        cursorLock.lock()
-        feedGeneration += 1
-        let generation = feedGeneration
-        cursorLock.unlock()
+        let generation = gate.bump()
         feeding = true
         let index = media.matroska
         mediaQueue.async { [weak self] in
             let step = index?.index(covering: start) ?? .advanced
+            let message = index?.lastIndexError ?? ""
             DispatchQueue.main.async {
-                guard let self, generation == self.feedGeneration else { return }
+                guard let self, self.gate.isCurrent(generation) else { return }
                 switch step {
                 case .cancelled:
                     return
                 case .retry:
                     self.workerRetries += 1
                     if self.workerRetries > 8 {
-                        self.lastError = index?.lastIndexError ?? "Indexing stalled."
-                        self.detail = self.lastError ?? ""
+                        self.fail(.indexing, message.isEmpty ? "Indexing stalled." : message)
                         self.feeding = false
-                        break
+                        return
                     }
-                    self.buffering = true
-                    self.detail = "Buffering"
+                    self.enterBuffering()
                     let delay = min(0.4 * pow(2, Double(self.workerRetries - 1)), 5)
                     self.mediaQueue.asyncAfter(deadline: .now() + delay) {
                         DispatchQueue.main.async {
-                            guard generation == self.feedGeneration else { return }
+                            guard self.gate.isCurrent(generation) else { return }
                             self.startFeeding(from: start)
                         }
                     }
                 case .malformed:
-                    self.lastError = index?.lastIndexError ?? "Matroska index is malformed."
-                    self.detail = self.lastError ?? ""
+                    self.fail(.indexing, message.isEmpty ? "Matroska index is malformed." : message)
                     self.feeding = false
                 case .advanced, .endOfFile:
                     self.workerRetries = 0
@@ -476,16 +461,10 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
     private func stopFeeding() {
         display.stopRequestingMediaData()
         audioRenderer.stopRequestingMediaData()
-        cursorLock.lock()
-        feedGeneration += 1
-        let generation = feedGeneration
-        bufferHolds = 0
-        videoDelay = 0.4
-        audioDelay = 0.4
-        cursorLock.unlock()
+        let generation = gate.bump()
         feeding = false
         DispatchQueue.main.async { [weak self] in
-            guard let self, generation == self.feedGeneration else { return }
+            guard let self, self.gate.isCurrent(generation) else { return }
             self.publish()
         }
     }
@@ -497,20 +476,14 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
         }
         if display.status == .failed { display.flush() }
         while display.isReadyForMoreMediaData {
-            cursorLock.lock()
-            if generation != feedGeneration {
-                cursorLock.unlock()
-                return
-            }
-            guard let media, media.video != nil else {
-                cursorLock.unlock()
+            guard let videoCursor = gate.videoIfCurrent(generation) else { return }
+            guard let media = gate.currentMedia(), media.video != nil else {
                 display.stopRequestingMediaData()
                 return
             }
             let count = listedCount(media, video: true)
             if videoCursor >= count {
                 let step = media.matroska?.indexAhead() ?? .endOfFile
-                cursorLock.unlock()
                 switch step {
                 case .advanced:
                     continue
@@ -520,40 +493,31 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
                 case .retry:
                     holdForBuffer(generation, video: true)
                     return
-                case .endOfFile, .malformed:
-                    if case .malformed = step {
-                        DispatchQueue.main.async { [weak self] in
-                            self?.lastError = media.matroska?.lastIndexError ?? "Matroska index is malformed."
-                        }
-                    }
+                case .malformed:
+                    let message = media.matroska?.lastIndexError ?? "Matroska index is malformed."
+                    DispatchQueue.main.async { [weak self] in self?.fail(.indexing, message) }
+                    display.stopRequestingMediaData()
+                    return
+                case .endOfFile:
+                    DispatchQueue.main.async { [weak self] in self?.finishEnded() }
                     display.stopRequestingMediaData()
                     return
                 }
             }
             guard let sample = listedSample(media, video: true, at: videoCursor) else {
-                cursorLock.unlock()
                 display.stopRequestingMediaData()
                 return
             }
-            let cursor = videoCursor
-            let total = count
-            cursorLock.unlock()
-            switch SamplePull.take(cursor: cursor, count: total, read: { try self.loadSample(media, sample) }) {
+            switch SamplePull.take(cursor: videoCursor, count: count, read: { try self.loadSample(media, sample) }) {
             case .finished:
+                DispatchQueue.main.async { [weak self] in self?.finishEnded() }
                 display.stopRequestingMediaData()
                 return
             case .retry:
                 holdForBuffer(generation, video: true)
                 return
             case .enqueued(let next, let bytes):
-                cursorLock.lock()
-                if generation != feedGeneration {
-                    cursorLock.unlock()
-                    return
-                }
-                videoCursor = next
-                videoDelay = 0.4
-                cursorLock.unlock()
+                guard gate.storeVideo(next, generation: generation) else { return }
                 noteFlowing()
                 let normalized = normalize(bytes)
                 guard !normalized.isEmpty, let buffer = makeVideoBuffer(normalized, sample, format) else { continue }
@@ -568,43 +532,35 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
             return
         }
         while audioRenderer.isReadyForMoreMediaData {
-            cursorLock.lock()
-            if generation != feedGeneration {
-                cursorLock.unlock()
-                return
-            }
-            guard let media, let track = media.audio, track.playableAudio else {
-                cursorLock.unlock()
+            guard let audioCursor = gate.audioIfCurrent(generation) else { return }
+            guard let media = gate.currentMedia(), let track = media.audio, track.playableAudio else {
                 audioRenderer.stopRequestingMediaData()
                 return
             }
             let count = listedCount(media, video: false)
             if audioCursor >= count {
                 let step = media.matroska?.indexAhead() ?? .endOfFile
-                cursorLock.unlock()
                 switch step {
                 case .advanced:
                     continue
-                case .cancelled:
+                case .cancelled, .endOfFile:
                     audioRenderer.stopRequestingMediaData()
                     return
                 case .retry:
                     holdForBuffer(generation, video: false)
                     return
-                case .endOfFile, .malformed:
+                case .malformed:
+                    let message = media.matroska?.lastIndexError ?? "Matroska index is malformed."
+                    DispatchQueue.main.async { [weak self] in self?.fail(.indexing, message) }
                     audioRenderer.stopRequestingMediaData()
                     return
                 }
             }
             guard let sample = listedSample(media, video: false, at: audioCursor) else {
-                cursorLock.unlock()
                 audioRenderer.stopRequestingMediaData()
                 return
             }
-            let cursor = audioCursor
-            let total = count
-            cursorLock.unlock()
-            switch SamplePull.take(cursor: cursor, count: total, read: { try self.loadSample(media, sample) }) {
+            switch SamplePull.take(cursor: audioCursor, count: count, read: { try self.loadSample(media, sample) }) {
             case .finished:
                 audioRenderer.stopRequestingMediaData()
                 return
@@ -612,14 +568,7 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
                 holdForBuffer(generation, video: false)
                 return
             case .enqueued(let next, let bytes):
-                cursorLock.lock()
-                if generation != feedGeneration {
-                    cursorLock.unlock()
-                    return
-                }
-                audioCursor = next
-                audioDelay = 0.4
-                cursorLock.unlock()
+                guard gate.storeAudio(next, generation: generation) else { return }
                 noteFlowing()
                 guard !bytes.isEmpty, let buffer = makeAudioBuffer(bytes, sample, format) else { continue }
                 audioRenderer.enqueue(buffer)
@@ -627,34 +576,19 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
         }
     }
 
-    /// Failed read. The cursor stays put. The clock stops until a later read works.
+    /// Failed read. The cursor stays put. The session moves to `.buffering` until a later read works.
     private func holdForBuffer(_ generation: Int, video: Bool) {
-        cursorLock.lock()
-        bufferHolds += 1
-        let delay = video ? videoDelay : audioDelay
-        if video { videoDelay = min(videoDelay * 2, 5) } else { audioDelay = min(audioDelay * 2, 5) }
-        cursorLock.unlock()
+        let delay = gate.beginHold(video: video)
         if video { display.stopRequestingMediaData() } else { audioRenderer.stopRequestingMediaData() }
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.buffering = true
-            self.detail = "Buffering"
-            self.sync.rate = 0
+            self?.enterBuffering()
         }
         mediaQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
-            self.cursorLock.lock()
-            let live = generation == self.feedGeneration
-            if live { self.bufferHolds = max(0, self.bufferHolds - 1) }
-            let waiting = self.bufferHolds > 0
-            self.cursorLock.unlock()
+            let (live, waiting) = self.gate.finishHold(generation)
             guard live else { return }
-            DispatchQueue.main.async {
-                if !waiting {
-                    self.buffering = false
-                    self.detail = self.readyDetail
-                    if self.playing { self.sync.rate = 1 }
-                }
+            if !waiting {
+                DispatchQueue.main.async { self.leaveBuffering() }
             }
             if video {
                 self.display.requestMediaDataWhenReady(on: self.mediaQueue) { [weak self] in
@@ -670,10 +604,66 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
 
     private func noteFlowing() {
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.bufferHolds == 0, self.buffering else { return }
-            self.buffering = false
-            self.detail = self.readyDetail
+            guard let self, self.gate.holdCount() == 0 else { return }
+            self.leaveBuffering()
         }
+    }
+
+    /// Playing or paused stalls into `.buffering`. The Boolean is only what `publish` derives.
+    private func enterBuffering() {
+        let generation = session.currentGeneration
+        switch session.currentState {
+        case .playing:
+            resumeAfterBuffer = .playing
+        case .paused:
+            resumeAfterBuffer = .paused
+        case .buffering:
+            publish()
+            sync.rate = 0
+            return
+        default:
+            return
+        }
+        guard session.adopt(generation, .buffering) else { return }
+        detail = "Buffering"
+        sync.rate = 0
+        publish()
+    }
+
+    private func leaveBuffering() {
+        guard session.currentState == .buffering else { return }
+        let generation = session.currentGeneration
+        let back: PlaybackState = resumeAfterBuffer == .paused ? .paused : .playing
+        guard session.adopt(generation, back) else { return }
+        detail = readyDetail
+        if back == .playing { sync.rate = 1 }
+        publish()
+    }
+
+    private func finishEnded() {
+        let generation = session.currentGeneration
+        switch session.currentState {
+        case .playing, .buffering, .paused:
+            break
+        default:
+            return
+        }
+        guard session.adopt(generation, .ended) else { return }
+        sync.rate = 0
+        stopTicker()
+        detail = "Ended"
+        publish()
+    }
+
+    private func fail(_ code: CinecoreFailure.Code, _ message: String) {
+        let generation = session.currentGeneration
+        let failure = CinecoreFailure(code, message)
+        guard session.adopt(generation, .failed(failure)) else { return }
+        self.failure = failure
+        lastError = message
+        detail = message
+        sync.rate = 0
+        publish()
     }
 
     private func loadSample(_ media: LoadedMedia, _ sample: SampleRec) throws -> Data {
@@ -819,7 +809,7 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
             let now = CMTimeGetSeconds(CMTimebaseGetTime(timebase))
             if now.isFinite { self.time = now }
             if self.duration > 0 && now >= self.duration - 0.05 {
-                self.pause()
+                self.finishEnded()
             }
         }
         ticker = timer
@@ -829,7 +819,7 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
     private func advanceJpeg() {
         guard let media, let track = media.video else { return }
         time += 0.1
-        if time >= duration { pause(); return }
+        if time >= duration { finishEnded(); return }
         if let sample = track.samples.last(where: { $0.pts <= time }) ?? track.samples.first,
            let bytes = try? loadSample(media, sample) {
             view.show(jpeg: bytes)

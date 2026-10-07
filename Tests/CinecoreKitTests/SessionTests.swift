@@ -166,4 +166,78 @@ final class SessionTests: XCTestCase {
         XCTAssertTrue(text.contains("HDR10"))
         XCTAssertTrue(text.contains("4"))
     }
+
+    func testBufferingAndEndedGoThroughTheSession() {
+        let session = PlayerSession()
+        let generation = session.beginOpen()
+        XCTAssertTrue(session.adopt(generation, .ready))
+        XCTAssertTrue(session.adopt(generation, .playing))
+        let playing = playbackFlags(session.currentState)
+        XCTAssertTrue(playing.playing)
+        XCTAssertFalse(playing.buffering)
+        XCTAssertTrue(session.adopt(generation, .buffering))
+        let stalled = playbackFlags(session.currentState)
+        XCTAssertFalse(stalled.playing)
+        XCTAssertTrue(stalled.buffering)
+        XCTAssertTrue(session.adopt(generation, .playing))
+        XCTAssertTrue(session.adopt(generation, .ended))
+        XCTAssertEqual(session.currentState, .ended)
+        let ended = playbackFlags(session.currentState)
+        XCTAssertFalse(ended.playing)
+        XCTAssertFalse(ended.buffering)
+    }
+
+    func testIndexStallBecomesFailed() {
+        let session = PlayerSession()
+        let generation = session.beginOpen()
+        XCTAssertTrue(session.adopt(generation, .ready))
+        XCTAssertTrue(session.adopt(generation, .playing))
+        let failure = CinecoreFailure(.indexing, "Indexing stalled.")
+        XCTAssertTrue(session.adopt(generation, .failed(failure)))
+        if case .failed(let error) = session.currentState {
+            XCTAssertEqual(error.code, .indexing)
+        } else {
+            XCTFail("expected failed")
+        }
+    }
+
+    func testFlagsAreNeverPlayingAndBuffering() {
+        let states: [PlaybackState] = [.idle, .opening, .ready, .playing, .buffering, .paused, .seeking, .ended, .failed(CinecoreFailure(.network, "down"))]
+        for state in states {
+            let flags = playbackFlags(state)
+            XCTAssertFalse(flags.playing && flags.buffering)
+        }
+    }
+
+    func testCancelledTokenAbortsTheLengthProbe() throws {
+        let file = URL(fileURLWithPath: "/tmp/cinecore-abort.bin")
+        try Data(repeating: 7, count: 128).write(to: file)
+        let server = try RangeServer(root: "/tmp", port: 18792)
+        defer { server.stop() }
+        try "2000".write(toFile: "/tmp/cinecore-delay-18792", atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(atPath: "/tmp/cinecore-delay-18792") }
+        let token = CancelToken()
+        let started = Date()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+            token.cancel()
+        }
+        XCTAssertThrowsError(try HTTPByteSource(url: URL(string: "http://127.0.0.1:18792/cinecore-abort.bin")!, token: token)) { error in
+            XCTAssertEqual(classify(error).code, .cancelled)
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1.2)
+    }
+
+    func testAlreadyCancelledTokenMakesNoRequest() throws {
+        let file = URL(fileURLWithPath: "/tmp/cinecore-nocall.bin")
+        try Data(repeating: 3, count: 32).write(to: file)
+        let server = try RangeServer(root: "/tmp", port: 18793)
+        defer { server.stop() }
+        let before = server.requests
+        let token = CancelToken()
+        token.cancel()
+        XCTAssertThrowsError(try HTTPByteSource(url: URL(string: "http://127.0.0.1:18793/cinecore-nocall.bin")!, token: token)) { error in
+            XCTAssertEqual(classify(error).code, .cancelled)
+        }
+        XCTAssertEqual(server.requests, before)
+    }
 }
