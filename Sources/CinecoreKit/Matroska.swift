@@ -156,6 +156,29 @@ private func exactBytes(_ source: MediaByteSource, _ offset: Int64, _ count: Int
     return Data()
 }
 
+/// A read that failed is not an empty file. Callers decide whether to retry.
+private func bytesNow(_ source: MediaByteSource, _ offset: Int64, _ count: Int) throws -> Data {
+    guard count > 0, offset >= 0, offset < source.length else { return Data() }
+    let n = Int(min(Int64(count), source.length - offset))
+    let data = try source.readExact(at: offset, count: n)
+    if data.count != n {
+        throw CinecoreError("Short index read at byte \(offset): \(data.count) of \(n).")
+    }
+    return data
+}
+
+private func peekNow(_ source: MediaByteSource, _ offset: Int64) throws -> IdSize? {
+    if offset < 0 || offset >= source.length { return nil }
+    return readIdSize(try bytesNow(source, offset, 16), 0)
+}
+
+public enum IndexAdvance: Equatable {
+    case advanced
+    case endOfFile
+    case malformed
+    case retry
+}
+
 func parseMatroska(_ source: MediaByteSource, webm: Bool) -> Result<MkvResult, CinecoreError> {
     var warnings: [String] = []
     var log: [String] = []
@@ -220,7 +243,7 @@ func parseMatroska(_ source: MediaByteSource, webm: Bool) -> Result<MkvResult, C
     }
     if title.isEmpty == false { log.append(title) }
     log.append("\(docType) · timescale \(scale) ns · \(drafts.count) tracks")
-    let remote = source is HTTPByteSource
+    let remote = source.indexesIncrementally
     var samplesByTrack: [Int: [SampleRec]] = [:]
     for draft in drafts { samplesByTrack[draft.number] = [] }
     var timeline: MatroskaIndex?
@@ -256,11 +279,16 @@ func parseMatroska(_ source: MediaByteSource, webm: Bool) -> Result<MkvResult, C
             let payloadStart = clusterAt + headerLen
             let payloadEnd = payloadStart + payload
             if payload > 0 && payload < 512_000_000 && payloadStart < fileLength && payloadEnd <= fileLength {
-                let frames = indexCluster(source, payloadStart, payloadEnd, scale, drafts)
-                for frame in frames {
-                    samplesByTrack[frame.track, default: []].append(SampleRec(
-                        pts: frame.pts, duration: frame.duration, key: frame.key, offset: frame.offset, size: frame.size, inline: nil
-                    ))
+                do {
+                    let frames = try indexCluster(source, payloadStart, payloadEnd, scale, drafts)
+                    for frame in frames {
+                        samplesByTrack[frame.track, default: []].append(SampleRec(
+                            pts: frame.pts, duration: frame.duration, key: frame.key, offset: frame.offset, size: frame.size, inline: nil
+                        ))
+                    }
+                } catch {
+                    warnings.append("Cluster read failed: \(error). Indexing stopped.")
+                    break
                 }
             }
             clusters += 1
@@ -352,6 +380,9 @@ public final class MatroskaIndex: @unchecked Sendable {
     private var playback: [Int64] = []
     /// First byte after the active chain. The next cluster, if there is one, starts here.
     private var frontier: Int64 = 0
+    /// Flat per-track samples for the active chain. Appended to. Not rebuilt per frame.
+    private var activeSamples: [Int: [SampleRec]] = [:]
+    public private(set) var lastIndexError: String?
 
     fileprivate init(source: any MediaByteSource, segmentEnd: Int64, scale: Int, drafts: [MkDraft], cues: [MatroskaCue]) {
         self.source = source
@@ -362,59 +393,111 @@ public final class MatroskaIndex: @unchecked Sendable {
         cueCount = cues.count
     }
 
-    /// Samples in the active chain only. A cached cluster from another seek is omitted.
     public func samples(for track: Int) -> [SampleRec] {
         lock.lock()
-        let frames = activeFrames().filter { $0.track == track }
-        lock.unlock()
-        return frames.map {
-            SampleRec(pts: $0.pts, duration: $0.duration, key: $0.key, offset: $0.offset, size: $0.size, inline: nil)
-        }
+        defer { lock.unlock() }
+        return activeSamples[track] ?? []
     }
 
-    /// Index the cluster that covers `time` and make it the playback start.
-    /// With cues, clusters before that cue are not read. Without cues, clusters
-    /// are walked until the time is inside the active chain, the segment ends,
-    /// or `cueLessWalkLimit` is hit.
-    public func index(covering time: Double) {
+    public func sampleCount(for track: Int) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeSamples[track]?.count ?? 0
+    }
+
+    public func sample(track: Int, at index: Int) -> SampleRec? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let list = activeSamples[track], index >= 0, index < list.count else { return nil }
+        return list[index]
+    }
+
+    public func firstIndex(track: Int, from time: Double, keyframe: Bool) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let list = activeSamples[track], !list.isEmpty else { return 0 }
+        var lo = 0
+        var hi = list.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if list[mid].pts < time { lo = mid + 1 } else { hi = mid }
+        }
+        var index = min(lo, list.count - 1)
+        if keyframe {
+            while index > 0, list[index].key == false { index -= 1 }
+        }
+        return index
+    }
+
+    @discardableResult
+    public func index(covering time: Double) -> IndexAdvance {
         if !cues.isEmpty {
-            guard let cue = cues.last(where: { $0.time <= time + 0.0008 }) ?? cues.first else { return }
-            if !isCached(cue.cluster) { cache(clusterAt: cue.cluster) }
+            guard let cue = cues.last(where: { $0.time <= time + 0.0008 }) ?? cues.first else { return .endOfFile }
+            if !isCached(cue.cluster) {
+                let step = cache(clusterAt: cue.cluster)
+                if step != .advanced { return step }
+            }
             activate(cue.cluster)
-            return
+            return .advanced
         }
         lock.lock()
         let hit = clusterCovering(time)
         lock.unlock()
         if let hit {
             activate(hit)
-            return
+            return .advanced
         }
         var walked = 0
         while walked < Self.cueLessWalkLimit {
-            if playbackCovers(time) { return }
-            if !indexAhead() { return }
+            if playbackCovers(time) { return .advanced }
+            let step = indexAhead()
+            if step != .advanced { return step }
             walked += 1
         }
+        return .advanced
     }
 
-    /// Index the next cluster after the active chain. A cluster already in the
-    /// cache is reused and not read again.
     @discardableResult
-    public func indexAhead() -> Bool {
+    public func indexAhead() -> IndexAdvance {
         lock.lock()
         var cursor = frontier
         let endLimit = segmentEnd
         lock.unlock()
+        if cursor + 2 >= endLimit {
+            lock.lock()
+            finished = true
+            lock.unlock()
+            return .endOfFile
+        }
         var skips = 0
         while cursor + 2 < endLimit && skips < 32 {
-            guard let head = peekId(source, cursor), let size = head.size else { break }
+            let head: IdSize
+            do {
+                guard let parsed = try peekNow(source, cursor) else {
+                    lastIndexError = "Cluster header at byte \(cursor) is not an element."
+                    return .malformed
+                }
+                head = parsed
+            } catch {
+                lastIndexError = String(describing: error)
+                return .retry
+            }
+            guard let size = head.size else {
+                lastIndexError = "Cluster element at byte \(cursor) has no size."
+                return .malformed
+            }
             let header = Int64(head.idLen + head.sizeLen)
             let next = cursor + header + Int64(size)
-            if next <= cursor { break }
+            if next <= cursor {
+                lastIndexError = "Element at byte \(cursor) does not advance."
+                return .malformed
+            }
             if head.id == MID.cluster {
-                if !isCached(cursor) { cache(clusterAt: cursor) }
-                return extend(cursor)
+                if !isCached(cursor) {
+                    let step = cache(clusterAt: cursor)
+                    if step != .advanced { return step }
+                }
+                return extend(cursor) ? .advanced : .malformed
             }
             cursor = next
             skips += 1
@@ -422,14 +505,14 @@ public final class MatroskaIndex: @unchecked Sendable {
         lock.lock()
         finished = true
         lock.unlock()
-        return false
+        return .endOfFile
     }
 
     @discardableResult
     fileprivate func ingest(clusterAt fileOffset: Int64) -> Bool {
-        let fresh = cache(clusterAt: fileOffset)
+        guard cache(clusterAt: fileOffset) == .advanced else { return false }
         activate(fileOffset)
-        return fresh
+        return true
     }
 
     private func isCached(_ fileOffset: Int64) -> Bool {
@@ -438,26 +521,31 @@ public final class MatroskaIndex: @unchecked Sendable {
         return clusters[fileOffset] != nil
     }
 
-    @discardableResult
-    private func cache(clusterAt fileOffset: Int64) -> Bool {
-        if isCached(fileOffset) { return false }
-        guard let head = peekId(source, fileOffset), head.id == MID.cluster, let size = head.size else { return false }
-        let header = Int64(head.idLen + head.sizeLen)
-        let start = fileOffset + header
-        let end = start + Int64(size)
-        guard end > start, end <= source.length else { return false }
-        let frames = indexCluster(source, start, end, scale, drafts)
-        lock.lock()
-        if clusters[fileOffset] == nil {
-            clusters[fileOffset] = (end, frames)
-            indexedClusters = clusters.count
+    private func cache(clusterAt fileOffset: Int64) -> IndexAdvance {
+        if isCached(fileOffset) { return .advanced }
+        do {
+            guard let head = try peekNow(source, fileOffset), head.id == MID.cluster, let size = head.size else {
+                lastIndexError = "Expected a cluster at byte \(fileOffset)."
+                return .malformed
+            }
+            let header = Int64(head.idLen + head.sizeLen)
+            let start = fileOffset + header
+            let end = start + Int64(size)
+            guard end > start, end <= source.length else { return .malformed }
+            let frames = try indexCluster(source, start, end, scale, drafts)
+            lock.lock()
+            if clusters[fileOffset] == nil {
+                clusters[fileOffset] = (end, frames)
+                indexedClusters = clusters.count
+            }
+            lock.unlock()
+            return .advanced
+        } catch {
+            lastIndexError = String(describing: error)
+            return .retry
         }
-        lock.unlock()
-        return true
     }
 
-    /// The active chain becomes this one cluster. Anything cached after it stays
-    /// cached, but it is not the next sample.
     private func activate(_ fileOffset: Int64) {
         lock.lock()
         defer { lock.unlock() }
@@ -465,6 +553,7 @@ public final class MatroskaIndex: @unchecked Sendable {
         playback = [fileOffset]
         frontier = cluster.end
         finished = frontier >= segmentEnd
+        activeSamples = records(cluster.frames)
     }
 
     private func extend(_ fileOffset: Int64) -> Bool {
@@ -475,15 +564,20 @@ public final class MatroskaIndex: @unchecked Sendable {
         playback.append(fileOffset)
         frontier = cluster.end
         finished = frontier >= segmentEnd
+        for (track, recs) in records(cluster.frames) {
+            activeSamples[track, default: []].append(contentsOf: recs)
+        }
         return true
     }
 
-    private func activeFrames() -> [FrameRef] {
-        var frames: [FrameRef] = []
-        for offset in playback {
-            if let cluster = clusters[offset] { frames.append(contentsOf: cluster.frames) }
+    private func records(_ frames: [FrameRef]) -> [Int: [SampleRec]] {
+        var built: [Int: [SampleRec]] = [:]
+        for frame in frames {
+            built[frame.track, default: []].append(SampleRec(
+                pts: frame.pts, duration: frame.duration, key: frame.key, offset: frame.offset, size: frame.size, inline: nil
+            ))
         }
-        return frames
+        return built
     }
 
     private func clusterCovering(_ time: Double) -> Int64? {
@@ -500,7 +594,8 @@ public final class MatroskaIndex: @unchecked Sendable {
     private func playbackCovers(_ time: Double) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard let last = activeFrames().max(by: { $0.pts < $1.pts }) else { return false }
+        let last = activeSamples.values.compactMap { $0.max(by: { $0.pts < $1.pts }) }.max(by: { $0.pts < $1.pts })
+        guard let last else { return false }
         return last.pts + max(last.duration, 0) + 0.001 >= time
     }
 }
@@ -618,22 +713,22 @@ private struct FrameRef { var track: Int; var pts: Double; var duration: Double;
 
 /// Cluster index. Element headers, timestamps, and block headers are read.
 /// Frame bytes are skipped. Their file offset and size are what playback reads later.
-private func indexCluster(_ source: MediaByteSource, _ start: Int64, _ end: Int64, _ scale: Int, _ drafts: [MkDraft]) -> [FrameRef] {
+private func indexCluster(_ source: MediaByteSource, _ start: Int64, _ end: Int64, _ scale: Int, _ drafts: [MkDraft]) throws -> [FrameRef] {
     var clusterTs = 0
     var frames: [FrameRef] = []
     var o = start
     while o + 2 < end {
-        guard let h = peekId(source, o), let size = h.size else { break }
+        guard let h = try peekNow(source, o), let size = h.size else { break }
         let header = Int64(h.idLen + h.sizeLen)
         let dataStart = o + header
         let dataEnd = dataStart + Int64(size)
         if dataEnd <= dataStart || dataEnd > end { break }
         if h.id == MID.timestamp {
-            clusterTs = uintOf(exactBytes(source, dataStart, min(size, 8)))
+            clusterTs = uintOf(try bytesNow(source, dataStart, min(size, 8)))
         } else if h.id == MID.simpleBlock {
-            frames.append(contentsOf: indexBlock(source, dataStart, dataEnd, clusterTs, scale, true, true, 0))
+            frames.append(contentsOf: try indexBlock(source, dataStart, dataEnd, clusterTs, scale, true, true, 0))
         } else if h.id == MID.blockGroup {
-            frames.append(contentsOf: indexGroup(source, dataStart, dataEnd, clusterTs, scale))
+            frames.append(contentsOf: try indexGroup(source, dataStart, dataEnd, clusterTs, scale))
         }
         o = dataEnd
     }
@@ -641,30 +736,30 @@ private func indexCluster(_ source: MediaByteSource, _ start: Int64, _ end: Int6
     return frames
 }
 
-private func indexGroup(_ source: MediaByteSource, _ start: Int64, _ end: Int64, _ clusterTs: Int, _ scale: Int) -> [FrameRef] {
+private func indexGroup(_ source: MediaByteSource, _ start: Int64, _ end: Int64, _ clusterTs: Int, _ scale: Int) throws -> [FrameRef] {
     var blockAt: (Int64, Int64)?
     var duration = 0
     var referenced = false
     var o = start
     while o + 2 < end {
-        guard let h = peekId(source, o), let size = h.size else { break }
+        guard let h = try peekNow(source, o), let size = h.size else { break }
         let header = Int64(h.idLen + h.sizeLen)
         let dataStart = o + header
         let dataEnd = dataStart + Int64(size)
         if dataEnd <= dataStart || dataEnd > end { break }
         if h.id == MID.block { blockAt = (dataStart, dataEnd) }
-        if h.id == MID.blockDuration { duration = uintOf(exactBytes(source, dataStart, min(size, 8))) }
+        if h.id == MID.blockDuration { duration = uintOf(try bytesNow(source, dataStart, min(size, 8))) }
         if h.id == MID.reference { referenced = true }
         o = dataEnd
     }
     guard let blockAt else { return [] }
-    return indexBlock(source, blockAt.0, blockAt.1, clusterTs, scale, false, !referenced, duration)
+    return try indexBlock(source, blockAt.0, blockAt.1, clusterTs, scale, false, !referenced, duration)
 }
 
-private func indexBlock(_ source: MediaByteSource, _ start: Int64, _ end: Int64, _ clusterTs: Int, _ scale: Int, _ simple: Bool, _ keyHint: Bool, _ blockDur: Int) -> [FrameRef] {
+private func indexBlock(_ source: MediaByteSource, _ start: Int64, _ end: Int64, _ clusterTs: Int, _ scale: Int, _ simple: Bool, _ keyHint: Bool, _ blockDur: Int) throws -> [FrameRef] {
     let length = end - start
     if length < 4 { return [] }
-    let prefix = exactBytes(source, start, Int(min(length, 16)))
+    let prefix = try bytesNow(source, start, Int(min(length, 16)))
     guard let vint = readValueVint(prefix, 0) else { return [] }
     var p = vint.len
     if p + 3 > prefix.count { return [] }
@@ -675,7 +770,7 @@ private func indexBlock(_ source: MediaByteSource, _ start: Int64, _ end: Int64,
     p += 1
     let key = simple ? (flags & 0x80) != 0 : keyHint
     let lacing = (flags & 0x06) >> 1
-    let spans = laceSpans(source, start + Int64(p), end, lacing)
+    let spans = try laceSpans(source, start + Int64(p), end, lacing)
     let pts0 = (Double(clusterTs + signed) * Double(scale)) / 1e9
     let each = !spans.isEmpty && blockDur > 0 ? (Double(blockDur) * Double(scale)) / 1e9 / Double(spans.count) : 0
     var out: [FrameRef] = []
@@ -687,12 +782,11 @@ private func indexBlock(_ source: MediaByteSource, _ start: Int64, _ end: Int64,
     return out
 }
 
-/// Lace headers only. `start` is the first byte after the block flags. `end` is the end of the block.
-private func laceSpans(_ source: MediaByteSource, _ start: Int64, _ end: Int64, _ mode: Int) -> [(Int64, Int64)] {
+private func laceSpans(_ source: MediaByteSource, _ start: Int64, _ end: Int64, _ mode: Int) throws -> [(Int64, Int64)] {
     if mode == 0 { return start < end ? [(start, end)] : [] }
     if start >= end { return [] }
     if mode == 2 {
-        let countByte = exactBytes(source, start, 1)
+        let countByte = try bytesNow(source, start, 1)
         if countByte.isEmpty { return [] }
         let count = Int(countByte[0]) + 1
         if count <= 0 { return [] }
@@ -706,7 +800,7 @@ private func laceSpans(_ source: MediaByteSource, _ start: Int64, _ end: Int64, 
             return (a, b)
         }
     }
-    let countByte = exactBytes(source, start, 1)
+    let countByte = try bytesNow(source, start, 1)
     if countByte.isEmpty { return [] }
     let count = Int(countByte[0]) + 1
     var pos = start + 1
@@ -715,7 +809,7 @@ private func laceSpans(_ source: MediaByteSource, _ start: Int64, _ end: Int64, 
         for _ in 0 ..< (count - 1) {
             var s: Int64 = 0
             while pos < end {
-                let b = exactBytes(source, pos, 1)
+                let b = try bytesNow(source, pos, 1)
                 if b.isEmpty { return [] }
                 pos += 1
                 s += Int64(b[0])
@@ -732,11 +826,11 @@ private func laceSpans(_ source: MediaByteSource, _ start: Int64, _ end: Int64, 
         if pos < end { frames.append((pos, end)) }
         return frames
     }
-    guard let first = readExactVint(source, pos, end) else { return pos < end ? [(pos, end)] : [] }
+    guard let first = try readExactVint(source, pos, end) else { return pos < end ? [(pos, end)] : [] }
     pos += Int64(first.len)
     var sizes = [Int64(first.value)]
     for i in 1 ..< count {
-        guard let v = readExactVint(source, pos, end) else { break }
+        guard let v = try readExactVint(source, pos, end) else { break }
         pos += Int64(v.len)
         let bias = (1 << (7 * v.len - 1)) - 1
         sizes.append(sizes[i - 1] + Int64(v.value - bias))
@@ -751,13 +845,13 @@ private func laceSpans(_ source: MediaByteSource, _ start: Int64, _ end: Int64, 
     return frames
 }
 
-private func readExactVint(_ source: MediaByteSource, _ offset: Int64, _ limit: Int64) -> (value: Int, len: Int)? {
+private func readExactVint(_ source: MediaByteSource, _ offset: Int64, _ limit: Int64) throws -> (value: Int, len: Int)? {
     if offset >= limit { return nil }
-    let first = exactBytes(source, offset, 1)
+    let first = try bytesNow(source, offset, 1)
     if first.isEmpty { return nil }
     let len = vintLen(Int(first[0]))
     if offset + Int64(len) > limit { return nil }
-    let raw = len == 1 ? first : exactBytes(source, offset, len)
+    let raw = len == 1 ? first : try bytesNow(source, offset, len)
     return readValueVint(raw, 0)
 }
 

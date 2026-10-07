@@ -35,7 +35,11 @@ SeekHead and Cues, then indexes only the first cluster. Later clusters are
 indexed when playback reaches them or a seek lands on a cue. The cache and
 the playback chain are separate. Seeking back onto a cluster already in
 memory starts again at that cluster. A cluster cached from a later seek is
-not the next frame. A file with no cues is walked forward until the requested
+not the next frame. Asking for the next sample reads the stored array. It does
+not rebuild it. A failed range read while indexing is a retry: the frontier
+stays put, and it is not reported as the end of the file. Remote open, seek,
+and cue-less scanning run off the main thread. The display is updated after
+the index work returns. A file with no cues is walked forward until the requested
 time is inside the chain, the file ends, or 50,000 clusters have been examined.
 
 A failed sample read does not advance the cursor. The clock pauses, `buffering`

@@ -12,9 +12,13 @@ public protocol MediaByteSource: AnyObject, Sendable {
     /// The exact range. Playback may widen a read into a cache block.
     /// Indexing must use this so a header does not pull the frame behind it.
     func readExact(at offset: Int64, count: Int) throws -> Data
+    /// Remote Matroska sets this so open returns after the first cluster.
+    var indexesIncrementally: Bool { get }
 }
 
 extension MediaByteSource {
+    public var indexesIncrementally: Bool { false }
+
     public func readExact(at offset: Int64, count: Int) throws -> Data {
         try read(at: offset, count: count)
     }
@@ -80,6 +84,7 @@ public final class FileByteSource: MediaByteSource, @unchecked Sendable {
 public final class HTTPByteSource: MediaByteSource, @unchecked Sendable {
     public let length: Int64
     public let url: URL
+    public var indexesIncrementally: Bool { true }
     private let bridge: HTTPBridge
     private let session: URLSession
     private let timeout: TimeInterval

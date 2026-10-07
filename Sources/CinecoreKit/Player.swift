@@ -39,6 +39,7 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
     private var videoCursor = 0
     private var audioCursor = 0
     private var bufferHolds = 0
+    private var workerRetries = 0
     private var videoDelay = 0.4
     private var audioDelay = 0.4
     private var readyDetail = "Standby"
@@ -70,11 +71,23 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
     }
 
     public func open(remote url: URL) {
-        do {
-            adopt(try CinecoreOpen.open(remote: url))
-        } catch {
-            lastError = error.localizedDescription
-            detail = lastError ?? "Remote open failed."
+        buffering = true
+        detail = "Opening"
+        lastError = nil
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let opened = try CinecoreOpen.open(remote: url)
+                DispatchQueue.main.async {
+                    self?.buffering = false
+                    self?.adopt(opened)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.buffering = false
+                    self?.lastError = error.localizedDescription
+                    self?.detail = self?.lastError ?? "Remote open failed."
+                }
+            }
         }
     }
 
@@ -175,10 +188,39 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
         display.flush()
         audioRenderer.flush()
         sync.setRate(0, time: CMTime(seconds: target, preferredTimescale: 600))
-        startFeeding(from: target)
-        if was {
-            sync.rate = 1
-            playing = true
+        let index = media?.matroska
+        buffering = index != nil
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let step = index?.index(covering: target) ?? .advanced
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.buffering = false
+                switch step {
+                case .retry:
+                    self.workerRetries += 1
+                    if self.workerRetries > 8 {
+                        self.lastError = index?.lastIndexError ?? "Could not index that position."
+                        self.detail = self.lastError ?? ""
+                        break
+                    }
+                    self.buffering = true
+                    self.detail = "Buffering"
+                    let delay = min(0.4 * pow(2, Double(self.workerRetries - 1)), 5)
+                    self.mediaQueue.asyncAfter(deadline: .now() + delay) {
+                        DispatchQueue.main.async { self.seek(to: target) }
+                    }
+                case .malformed:
+                    self.lastError = index?.lastIndexError ?? "Could not index that position."
+                    self.detail = self.lastError ?? ""
+                case .advanced, .endOfFile:
+                    self.workerRetries = 0
+                    self.startFeeding(from: target)
+                    if was {
+                        self.sync.rate = 1
+                        self.playing = true
+                    }
+                }
+            }
         }
     }
 
@@ -199,35 +241,94 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
         duration = 0
     }
 
-    private func listedSamples(_ media: LoadedMedia, video: Bool) -> [SampleRec] {
+    private func listedCount(_ media: LoadedMedia, video: Bool) -> Int {
         if let index = media.matroska {
             let id = video ? media.video?.report.id : media.audio?.report.id
-            if let id { return index.samples(for: id) }
+            if let id { return index.sampleCount(for: id) }
         }
-        return (video ? media.video?.samples : media.audio?.samples) ?? []
+        return (video ? media.video?.samples : media.audio?.samples)?.count ?? 0
     }
 
-    private func startFeeding(from start: Double) {
+    private func listedSample(_ media: LoadedMedia, video: Bool, at index: Int) -> SampleRec? {
+        if let matroska = media.matroska {
+            let id = video ? media.video?.report.id : media.audio?.report.id
+            if let id { return matroska.sample(track: id, at: index) }
+        }
+        let samples = (video ? media.video?.samples : media.audio?.samples) ?? []
+        guard index >= 0, index < samples.count else { return nil }
+        return samples[index]
+    }
+
+    private func armCursors(from start: Double, generation: Int) {
         guard let media, media.video != nil else { return }
-        media.matroska?.index(covering: start)
-        let videoSamples = listedSamples(media, video: true)
-        let audioSamples = listedSamples(media, video: false)
+        let videoIndex: Int
+        let audioIndex: Int
+        if let matroska = media.matroska, let videoId = media.video?.report.id {
+            videoIndex = matroska.firstIndex(track: videoId, from: start, keyframe: true)
+            audioIndex = media.audio?.report.id.map { matroska.firstIndex(track: $0, from: start, keyframe: false) } ?? 0
+        } else {
+            videoIndex = FeedPoint.video(media.video?.samples ?? [], from: start)
+            audioIndex = FeedPoint.audio(media.audio?.samples ?? [], from: start)
+        }
         cursorLock.lock()
-        feedGeneration += 1
-        let generation = feedGeneration
-        videoCursor = FeedPoint.video(videoSamples, from: start)
-        audioCursor = FeedPoint.audio(audioSamples, from: start)
+        guard generation == feedGeneration else {
+            cursorLock.unlock()
+            return
+        }
+        videoCursor = videoIndex
+        audioCursor = audioIndex
         bufferHolds = 0
         videoDelay = 0.4
         audioDelay = 0.4
         cursorLock.unlock()
-        feeding = true
         display.requestMediaDataWhenReady(on: mediaQueue) { [weak self] in
             self?.supplyVideo(generation)
         }
         if audioFormat != nil {
             audioRenderer.requestMediaDataWhenReady(on: mediaQueue) { [weak self] in
                 self?.supplyAudio(generation)
+            }
+        }
+    }
+
+    private func startFeeding(from start: Double) {
+        guard let media, media.video != nil else { return }
+        cursorLock.lock()
+        feedGeneration += 1
+        let generation = feedGeneration
+        cursorLock.unlock()
+        feeding = true
+        let index = media.matroska
+        mediaQueue.async { [weak self] in
+            let step = index?.index(covering: start) ?? .advanced
+            DispatchQueue.main.async {
+                guard let self, generation == self.feedGeneration else { return }
+                switch step {
+                case .retry:
+                    self.workerRetries += 1
+                    if self.workerRetries > 8 {
+                        self.lastError = index?.lastIndexError ?? "Indexing stalled."
+                        self.detail = self.lastError ?? ""
+                        self.feeding = false
+                        break
+                    }
+                    self.buffering = true
+                    self.detail = "Buffering"
+                    let delay = min(0.4 * pow(2, Double(self.workerRetries - 1)), 5)
+                    self.mediaQueue.asyncAfter(deadline: .now() + delay) {
+                        DispatchQueue.main.async {
+                            guard generation == self.feedGeneration else { return }
+                            self.startFeeding(from: start)
+                        }
+                    }
+                case .malformed:
+                    self.lastError = index?.lastIndexError ?? "Matroska index is malformed."
+                    self.detail = self.lastError ?? ""
+                    self.feeding = false
+                case .advanced, .endOfFile:
+                    self.workerRetries = 0
+                    self.armCursors(from: start, generation: generation)
+                }
             }
         }
     }
@@ -264,17 +365,33 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
                 display.stopRequestingMediaData()
                 return
             }
-            let samples = listedSamples(media, video: true)
-            if videoCursor >= samples.count {
-                let grow = media.matroska?.indexAhead() ?? false
+            let count = listedCount(media, video: true)
+            if videoCursor >= count {
+                let step = media.matroska?.indexAhead() ?? .endOfFile
                 cursorLock.unlock()
-                if grow { continue }
+                switch step {
+                case .advanced:
+                    continue
+                case .retry:
+                    holdForBuffer(generation, video: true)
+                    return
+                case .endOfFile, .malformed:
+                    if case .malformed = step {
+                        DispatchQueue.main.async { [weak self] in
+                            self?.lastError = media.matroska?.lastIndexError ?? "Matroska index is malformed."
+                        }
+                    }
+                    display.stopRequestingMediaData()
+                    return
+                }
+            }
+            guard let sample = listedSample(media, video: true, at: videoCursor) else {
+                cursorLock.unlock()
                 display.stopRequestingMediaData()
                 return
             }
-            let sample = samples[videoCursor]
             let cursor = videoCursor
-            let total = samples.count
+            let total = count
             cursorLock.unlock()
             switch SamplePull.take(cursor: cursor, count: total, read: { try self.loadSample(media, sample) }) {
             case .finished:
@@ -316,17 +433,28 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
                 audioRenderer.stopRequestingMediaData()
                 return
             }
-            let samples = listedSamples(media, video: false)
-            if audioCursor >= samples.count {
-                let grow = media.matroska?.indexAhead() ?? false
+            let count = listedCount(media, video: false)
+            if audioCursor >= count {
+                let step = media.matroska?.indexAhead() ?? .endOfFile
                 cursorLock.unlock()
-                if grow { continue }
+                switch step {
+                case .advanced:
+                    continue
+                case .retry:
+                    holdForBuffer(generation, video: false)
+                    return
+                case .endOfFile, .malformed:
+                    audioRenderer.stopRequestingMediaData()
+                    return
+                }
+            }
+            guard let sample = listedSample(media, video: false, at: audioCursor) else {
+                cursorLock.unlock()
                 audioRenderer.stopRequestingMediaData()
                 return
             }
-            let sample = samples[audioCursor]
             let cursor = audioCursor
-            let total = samples.count
+            let total = count
             cursorLock.unlock()
             switch SamplePull.take(cursor: cursor, count: total, read: { try self.loadSample(media, sample) }) {
             case .finished:
