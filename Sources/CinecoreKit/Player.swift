@@ -98,10 +98,11 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
         failure = nil
         publish()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let token = self.session.currentToken
             do {
-                let token = self.session.currentToken
                 let opened = try CinecoreOpen.open(remote: url, token: token)
-                DispatchQueue.main.async {
+                DispatchQueue.main.async { [weak self] in
                     guard let self, self.session.isCurrent(generation) else {
                         (opened.source as? HTTPByteSource)?.cancelWork()
                         return
@@ -110,9 +111,9 @@ public final class CinecorePlayer: NSObject, ObservableObject, @unchecked Sendab
                     self.adopt(opened, generation: generation)
                 }
             } catch {
-                DispatchQueue.main.async {
+                let failure = classify(error)
+                DispatchQueue.main.async { [weak self] in
                     guard let self, self.session.isCurrent(generation) else { return }
-                    let failure = classify(error)
                     _ = self.session.adopt(generation, .failed(failure))
                     self.failure = failure
                     self.lastError = failure.message
